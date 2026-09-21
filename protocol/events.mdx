@@ -1,7 +1,7 @@
 ---
-title: "Protocol Events: Engine-to-Client Messages"
+title: "CodeLoom Protocol Events: Engine-to-Client Reference"
 sidebarTitle: "Events"
-description: "Complete reference for all engine-to-client events — when each fires, every field it carries, and how groups of events combine to represent chat, agents, files, and session state."
+description: "Complete reference for every engine-to-client event: when it fires, every field, and how events combine to represent chat, agents, files, and state."
 ---
 
 Events are the engine's half of the CodeLoom wire protocol. The engine emits them on the write side of every connected client's socket as newline-delimited JSON objects. Every event carries a `type` field matching its Python dataclass name; optional fields are omitted when `None` or empty. Events fan out to all connected clients simultaneously — every subscriber sees the same stream.

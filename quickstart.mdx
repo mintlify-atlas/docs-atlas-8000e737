@@ -1,5 +1,5 @@
 ---
-title: "Get Started with CodeLoom Engine"
+title: "CodeLoom Engine Quickstart: Install and Run the Agent"
 sidebarTitle: "Quickstart"
 description: "Go from zero to your first agent response in minutes: clone the repo, set your OpenRouter key, start the engine, and connect the reference TUI client."
 ---
@@ -93,7 +93,7 @@ A Unix-like operating system is required. The transport is an `AF_UNIX` domain s
 
     The server prints a startup banner and then begins listening:
 
-    ```
+    ```text
     === Engine Server Startup ===
     workspace: /path/to/your/project
     engine dir: /path/to/your/project/.engine
@@ -121,7 +121,7 @@ A Unix-like operating system is required. The transport is an `AF_UNIX` domain s
 
     The TUI layout looks like this:
 
-    ```
+    ```text
     +---------------------------+----------------------+
     |                           | Agents · N           |
     |                           | nickname / profile   |
@@ -145,13 +145,13 @@ A Unix-like operating system is required. The transport is an `AF_UNIX` domain s
   <Step title="Send your first message">
     Type in the input bar at the bottom and press Enter. Anything not recognized as a command is sent as `SubmitUserMessage`.
 
-    ```
+    ```text
     where is the retry logic in this codebase?
     ```
 
     You can also use specific commands:
 
-    ```
+    ```text
     openfile src/main.py
     undo
     ```
@@ -204,7 +204,7 @@ You can also send `Shutdown` from a connected client, which ends the active sess
   <Card title="Configuration" icon="sliders" href="/configuration">
     Full reference for every environment variable, including LLM settings, turn limits, exec approval, and metrics.
   </Card>
-  <Card title="Protocol reference" icon="plug" href="/protocol">
+  <Card title="Protocol reference" icon="plug" href="/protocol/overview">
     Complete list of commands and events with field-level descriptions for building your own client.
   </Card>
 </CardGroup>

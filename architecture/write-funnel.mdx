@@ -1,7 +1,7 @@
 ---
-title: "The Write Funnel: Safe File Editing Pipeline"
+title: "The Write Funnel: Safe and Atomic File Editing Pipeline"
 sidebarTitle: "Write Funnel"
-description: "Every stage a file edit passes through before bytes hit disk — path guard, staleness check, mutation, syntax gate, atomic write, journal record, LSP sync, and the on_edit callback."
+description: "The safety pipeline every file edit traverses: path guard, staleness check, mutation, syntax gate, atomic write, journal record, and LSP sync."
 ---
 
 Every file write in CodeLoom Engine flows through a single module: `runtime/tools/edits.py`. Tools supply a pure `str → str` mutation function; the funnel wraps it with every safety mechanism the engine provides. A tool author who calls `apply_edit` inherits staleness detection, path guarding, newline and encoding preservation, a tree-sitter syntax check, an atomic disk write, a journal entry, LSP diagnostic sync, and full undo support — for free.
@@ -48,13 +48,22 @@ The funnel's synchronous core (`_prepare` / `_commit` / `_apply_sync`) is delibe
             raise WorkspacePathError(f"writes to {part}/ are not allowed")
     ```
 
-    The **denylist** enforced by `should_skip_name`:
+    The **denylist** is applied in two layers inside `guard_write_path`:
+
+    **Layer 1 — `should_skip_name` (path component check, from `runtime/tools/fs.py`):**
 
     | Category | Names |
     |---|---|
     | VCS | `.git` |
     | Engine internals | `.engine`, `.cursor` |
-    | Build / cache | `__pycache__`, `node_modules`, `.venv`, `venv`, `.ruff_cache` |
+    | Build / cache | `__pycache__`, `node_modules`, `.venv`, `venv`, `.ruff_cache`, `ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.tox`, `.nox`, `.cache`, `.eggs`, `.ipynb_checkpoints`, `.parcel-cache`, `.next`, `.nuxt`, `.turbo`, `.nyc_output`, `htmlcov`, `coverage`, `site-packages`, `dist`, `build` |
+    | Package metadata | `*.egg-info`, `*.dist-info` |
+    | Dynamic | Any directory whose name starts with `.` and contains `cache` |
+
+    **Layer 2 — filename-level checks (in `guard_write_path`, from `runtime/tools/fileid.py`):**
+
+    | Category | Names |
+    |---|---|
     | Lockfiles | `package-lock.json`, `uv.lock`, `poetry.lock`, `Cargo.lock`, `go.sum` |
     | Secrets | `env.sh`, `.env`, `.env.*` |
 
@@ -93,6 +102,8 @@ The funnel's synchronous core (`_prepare` / `_commit` / `_apply_sync`) is delibe
 
   <Step title="Apply the mutation">
     `mutate(src)` is called with the `FileSource`. Tools supply domain-specific logic here: `str_replace` for substring replacement, `replace_lines` for a numbered window, `hunks_to_text` for a unified diff patch, and so on. The mutation receives normalised (LF-only) text and must return normalised text. Any `ValueError` is wrapped as an `EditError`.
+
+    For unified diff patches, `parse_unified_diff` parses the hunk headers and `hunks_to_text` locates each hunk using `HUNK_FUZZ = 5`. If a hunk does not match at the declared line number, the locator searches up to ±5 lines before raising an `EditError`. This tolerance accommodates minor context drift without silently applying hunks to the wrong location.
   </Step>
 
   <Step title="Syntax gate (tree-sitter ERROR comparison)">

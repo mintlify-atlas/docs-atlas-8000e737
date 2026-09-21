@@ -176,7 +176,7 @@ These variables set the per-client event queue limits. You should rarely need to
 
 Malformed values do not crash the engine. `EngineConfig.from_env()` collects parse failures and invalid enum choices into a `warnings` list, which is emitted as `WarningOccurred` events to all connected clients at session bind time. For example, setting `ENGINE_EXEC_APPROVAL=banana` produces:
 
-```
+```text
 warning: ENGINE_EXEC_APPROVAL='banana' is not auto|always|never; using auto
 ```
 

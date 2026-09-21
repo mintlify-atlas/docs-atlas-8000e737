@@ -1,7 +1,7 @@
 ---
 title: "Memory and Skills Tools: Persist Knowledge Across Turns"
 sidebarTitle: "Memory & Skills"
-description: "Five tools for storing workspace facts between turns, loading reusable skill playbooks, scanning for technical debt markers, and controlling a headless Playwright browser."
+description: "Five tools to persist workspace facts across turns, load reusable skill playbooks, scan for technical debt markers, and control a headless browser."
 ---
 
 These tools extend an agent's effective context beyond the current turn. Memory tools write to `.engine/memory.json` in the workspace and persist across sessions. Skill tools load structured playbooks from a catalog. The browser tools provide a headless Chromium session for debugging live UIs.
@@ -100,7 +100,7 @@ Loads the `SKILL.md` body of a named skill from the engine's skill catalog into 
 
 The full text of `SKILL.md` for the named skill, followed by:
 
-```
+```text
 Sibling files: schema.json, template.py, examples/
 ```
 
@@ -152,13 +152,13 @@ Scans for technical debt markers using ripgrep. By default, searches for `TODO`,
 
 ### Return value
 
-```
+```text
 src/main.py:42:    # TODO: handle timeout edge case
 runtime/session.py:118:    # FIXME: race condition when session closes
 agents/loop.py:77:    # XXX: magic number 3
 ```
 
-Results are in `path:line:text` format, capped at 80 hits (the same `DEFAULT_MAX_MATCHES` as `search`). Returns `(no matches)` when none are found.
+Results are in `path:line:text` format, capped at 80 hits (`DEFAULT_LIMIT = 80` in `runtime/tools/scan.py`). Returns `(none)` when none are found.
 
 ---
 
@@ -223,7 +223,7 @@ async browser_network() -> str
 Returns up to 80 network events since the last `browser_open` that represent failures or HTTP 4xx/5xx responses. Successful requests are not reported.
 
 **Format:**
-```
+```text
 FAIL GET https://api.example.com/data net::ERR_CONNECTION_REFUSED
 404 GET https://cdn.example.com/bundle.js
 500 POST https://api.example.com/submit

@@ -1,7 +1,7 @@
 ---
 title: "Troubleshoot Common CodeLoom Engine Issues"
 sidebarTitle: "Troubleshooting"
-description: "Diagnose and fix the most common CodeLoom Engine problems: startup failures, API key rejections, LLM errors, file edit denials, LSP gaps, and MCP connection issues."
+description: "Diagnose and fix common CodeLoom Engine problems: startup failures, API key rejections, LLM errors, file-write denials, LSP gaps, and subscriber overflow."
 ---
 
 Most problems with CodeLoom Engine fall into one of a small number of categories. This page walks through each one with the exact error you will see, why it happens, and how to resolve it. Enable trace logging as a first step when the cause is not obvious — it captures every tool call and its result in `.engine/trace.jsonl` without affecting the run.
@@ -316,12 +316,12 @@ tail -f /path/to/workspace/.engine/trace.jsonl | python -m json.tool
 If a client connection falls behind reading events, the `Subscriber` buffer (default 4,096 events, 1 MiB) will fill up. When this happens:
 
 1. Droppable events (`ChatMessageDelta`, `CommandOutputChunk`) are evicted first
-2. If the buffer is still full, a `WarningOccurred` event replaces the oldest event with an overflow notice:
-   ```
+2. If the buffer is still full, an `ErrorOccurred` event replaces the tail of the queue with an overflow notice:
+   ```text
    event stream overflowed; N events dropped, send RequestSnapshot to resync
    ```
 3. When the client drains below the recovery mark (1,024 events), a follow-up `WarningOccurred` appears:
-   ```
+   ```text
    dropped N streaming events while the client was behind; full message text was not affected
    ```
 

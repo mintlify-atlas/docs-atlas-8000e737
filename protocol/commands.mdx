@@ -1,7 +1,7 @@
 ---
-title: "Protocol Commands: Client-to-Engine Messages"
+title: "Protocol Commands: All 22 Client-to-Engine Messages"
 sidebarTitle: "Commands"
-description: "Complete reference for all 22 typed commands a client sends over the Unix socket to control sessions, submit messages, manage files, drive agents, and configure integrations."
+description: "All 22 typed commands a client sends over the Unix socket — session lifecycle, messaging, file ops, agent control, git, and integrations."
 ---
 
 Commands are the client's half of the CodeLoom wire protocol. Each command is a JSON object with a `type` field matching the Python dataclass name. Send one JSON object per line, terminated by `\n`, on the write side of the Unix socket. The engine processes commands sequentially within a session; unknown types, malformed JSON, or missing required fields all produce an `ErrorOccurred` event without dropping the connection.

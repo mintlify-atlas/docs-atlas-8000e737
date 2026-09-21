@@ -1,7 +1,7 @@
 ---
-title: "EngineSnapshot: Full Session State on Reconnect"
+title: "EngineSnapshot Reference: Full Session State Fields"
 sidebarTitle: "Snapshot"
-description: "Reference for EngineSnapshot and every sub-type it carries — ChatMessage, GitState, Stats, AgentRow, and more — plus which fields are stripped when a session is persisted."
+description: "Reference for EngineSnapshot and all sub-types — ChatMessage, GitState, Stats, AgentRow, and more — plus which fields are stripped on persistence."
 ---
 
 `EngineSnapshot` is the reconnect payload. Every time a client sends `StartSession` or `RequestSnapshot`, the engine builds a snapshot of the entire live session and delivers it inside a `SnapshotReady` event. The snapshot is the single source of truth for initialising or refreshing client-side state — chat history, open files, git status, active agents, integrations, and usage statistics, all in one message.

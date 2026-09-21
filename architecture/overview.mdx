@@ -1,7 +1,7 @@
 ---
-title: "CodeLoom Engine Architecture: From Socket to LLM"
+title: "CodeLoom Engine Architecture: From Unix Socket to LLM"
 sidebarTitle: "Overview"
-description: "A full-stack walkthrough of the five component layers — transport, session, agent loop, tools, and storage — and how a user message travels through all of them."
+description: "Full-stack walkthrough of the five layers — transport, session, agent loop, tools, and storage — and how a user message travels through all of them."
 ---
 
 CodeLoom Engine is a **headless AI coding agent backend** that enforces a hard boundary between client interfaces and agent internals. Every interaction crosses a Unix domain socket as newline-delimited JSON; nothing else is shared. The design arranges five vertical layers — transport, session, orchestrator, tool registry, and persistence — so that each layer knows only about the one below it. Understanding this layering is the fastest route to extending, debugging, or connecting to the engine.
@@ -76,7 +76,7 @@ The engine runs a **single asyncio event loop**. No threads own the event loop; 
 
 **Per-client tasks.** `EngineServer._on_client` creates two tasks per connection — `_read_commands` and `_write_events`. When either finishes, `asyncio.wait(return_when=FIRST_COMPLETED)` fires and the other is cancelled. `ConnectionError` and `BrokenPipeError` are swallowed; anything else propagates.
 
-**Event fan-out.** `EngineSession._emit` iterates `self._subscribers` and calls `Subscriber.put` on each. `Subscriber` is a bounded deque (default 4096 items / 1 MiB). When capacity is exceeded, droppable events (`ChatMessageDelta`, `CommandOutputChunk`) are evicted first; if the queue still overflows, the oldest item is replaced with an `ErrorOccurred` overflow notice. The client can call `RequestSnapshot` to resync.
+**Event fan-out.** `EngineSession._emit` iterates `self._subscribers` and calls `Subscriber.put` on each. `Subscriber` is a bounded deque with a dual ceiling: **4096 items** and **1 MiB bytes** (both configurable via `ENGINE_SUBSCRIBER_CAPACITY` and `ENGINE_SUBSCRIBER_BYTES`). When either ceiling is hit, droppable events (`ChatMessageDelta`, `CommandOutputChunk`) are evicted first (reverse-order scan). If no droppable events exist and the queue is still full, the **most-recently queued item** is replaced with an `ErrorOccurred` overflow notice — ensuring the client always learns the queue overflowed. The client can call `RequestSnapshot` to resync.
 
 **Write lock.** The `EngineSession` owns a single `asyncio.Lock` that every file edit acquires before entering `_apply_sync`. The lock is intentional: the write funnel's `_prepare` / `_commit` / `_apply_sync` path must never `await` mid-write because any suspension would open a read-modify-write race between the staleness check and the atomic replace.
 

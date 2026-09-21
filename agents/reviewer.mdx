@@ -1,7 +1,7 @@
 ---
 title: "Reviewer Agent: Code Review in a Writer's Worktree"
 sidebarTitle: "Reviewer"
-description: "The reviewer profile joins an existing writer's git worktree to inspect the real diff with sitter and LSP, then returns a specific approve, request-changes, or block verdict — never editing files."
+description: "Joins a writer's git worktree, inspects the diff with sitter and LSP, and returns an approve, request-changes, or block verdict. Read-only."
 ---
 
 After a coder or tester finishes, the orchestrator can spawn a **reviewer** to inspect the diff before the user decides what to do with the worktree. Reviewer is the only profile that uses `join_worktree=True` — it joins the writer's existing git checkout rather than creating its own. It has full LSP and tree-sitter access to read the changed code in context, but it cannot edit files or run shell commands. It returns a verdict with paths and specific findings, not a rubber stamp.

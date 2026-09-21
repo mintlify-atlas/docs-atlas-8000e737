@@ -1,7 +1,7 @@
 ---
 title: "Researcher Agent: External Library and API Investigation"
 sidebarTitle: "Researcher"
-description: "The researcher profile surveys external libraries, GitHub repos, package registries, and API docs — never editing the workspace — and delivers a source-cited briefing the orchestrator passes to coder."
+description: "Surveys external libraries, GitHub repos, package registries, and API docs. Delivers a source-cited briefing to coder — never edits the workspace."
 ---
 
 When the orchestrator needs facts about something that is not in the local workspace — a third-party library, an external API, a GitHub repository, a CVE, or documentation — it spawns the **researcher** personality. Researcher has no filesystem write access and never runs shell commands. Its entire job is to gather external facts, cite their sources, and produce a briefing specific enough that a coder can act on it without re-fetching the same pages.

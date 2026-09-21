@@ -1,7 +1,7 @@
 ---
-title: "Language Detection and LSP Server Setup"
+title: "Language Detection, LSP Servers, and Tree-Sitter in CodeLoom"
 sidebarTitle: "Language Support"
-description: "How CodeLoom Engine detects your workspace language from file markers and extension counts, which LSP servers it launches, and how tree-sitter grammars power syntax tools."
+description: "How CodeLoom Engine detects workspace language via markers and extension counts, which LSP servers it warms up, and how tree-sitter powers syntax tools."
 ---
 
 CodeLoom Engine performs language detection once at session startup, then uses that result to warm-start an LSP server and load the appropriate tree-sitter grammar. Three languages have full support — Python, Go, and JavaScript/TypeScript. Fourteen more are detected by name but receive no tooling. Workspaces with unsupported or undetected languages still work; the engine emits a `WarningOccurred` event and the agent falls back to `read_file` and `search`.
@@ -162,19 +162,19 @@ The `LSPManager` tracks a SHA-256 hash of the text last sent to each server. Bef
 
 When no LSP server is configured for a file's extension, LSP tools return a descriptive error string instead of raising an exception. The agent can continue working using `read_file`, `search`, and tree-sitter outline tools.
 
-```
+```text
 error: No LSP server configured for extension '.rb'
 ```
 
 Similarly, when the entire LSP manager is unavailable (server not installed, binary not on `$PATH`), the tool wrapping layer catches the launch failure and returns:
 
-```
+```text
 error: LSP server is not running
 ```
 
 Tree-sitter tools degrade independently of LSP. If a file's extension is not in `EXTENSION_TO_LANG`, tree-sitter tools return:
 
-```
+```text
 error: no tree-sitter grammar for 'path/to/file.rb'
 (extension .rb; supported: python, go, javascript, typescript)
 ```

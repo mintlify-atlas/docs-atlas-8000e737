@@ -1,7 +1,7 @@
 ---
-title: "Create a Custom Subagent Personality Profile"
+title: "Create a Custom Subagent Personality Profile in CodeLoom"
 sidebarTitle: "Adding a Profile"
-description: "Define an AgentProfile dataclass, configure tool allowlists and write_globs, and let the engine auto-discover your new subagent personality on the next StartSession."
+description: "Define an AgentProfile dataclass, configure tool allowlists and write_globs, and let the engine auto-discover your new subagent personality."
 ---
 
 Profiles are how you teach the engine a new personality. Each profile becomes a tool the orchestrator can call by name — the orch sees `ask(task=...)`, `coder(task=...)`, or your own `auditor(task=...)` as first-class choices. The entire registration step is: create a file, export `PROFILE`, restart (or call `discover_profiles()` in a test).
@@ -81,22 +81,60 @@ class AgentProfile:
 `agents/profile.py` exports named lists you can compose as `tool_names`:
 
 ```python title="agents/profile.py (constants)"
-NAV    = ["list_files", "read_file", "search"]
-SITTER = ["list_symbols", "find_symbol", "get_node_at", "query_tree", "parse_file"]
-LSP    = ["goto_definition", "find_references", "hover", "get_diagnostics", "document_symbols"]
-EDIT   = ["str_replace", "replace_lines", "insert_at_line", "create_file",
-          "replace_symbol", "insert_after_imports", "apply_patch",
-          "rename_symbol", "undo_edit", "list_edits"]
-SHELL  = ["run_command"]
-WEB    = ["web_search", "web_fetch"]
-GIT    = ["git_status", "git_diff", "git_log", "git_show", "git_blame", "git_range"]
-GH_READ = GH_SOCIAL + GH_REPO    # read-only GitHub tools
+NAV     = ["list_files", "read_file", "search"]
+SITTER  = ["list_symbols", "find_symbol", "get_node_at", "query_tree", "parse_file"]
+LSP     = ["goto_definition", "find_references", "hover", "get_diagnostics", "document_symbols"]
+EDIT    = ["str_replace", "replace_lines", "insert_at_line", "create_file",
+           "replace_symbol", "insert_after_imports", "apply_patch",
+           "rename_symbol", "undo_edit", "list_edits"]
+SHELL   = ["run_command"]
+WEB     = ["web_search", "web_fetch"]
+GIT     = ["git_status", "git_diff", "git_log", "git_show", "git_blame", "git_range"]
+GH_READ  = GH_SOCIAL + GH_REPO   # read-only GitHub tools (issues, PRs, runs, repo)
+GH_WRITE = ["gh_pr_comment", "gh_issue_create"]
 BROWSER = ["browser_open", "browser_console", "browser_screenshot", "browser_network"]
 MEMORY  = ["remember"]
 SKILLS  = ["activate_skill", "read_skill"]
+MCP     = ["mcp"]                 # expands to all MCP tools allowed for the profile
+PKG     = ["pkg_info"]
+DOCS    = ["docs_lookup", "tldr"]
+SEC     = ["osv_query"]
+HTTP    = ["http_request", "openapi_ops"]
+SCAN    = ["todo_scan"]
+ENV     = ["runtime_info"]
+DEP     = ["dep_why"]
 ```
 
 Mix and match: `tool_names = NAV + SITTER + LSP + EDIT + SHELL + GIT + MEMORY + SKILLS` is how `coder` is built.
+
+## Special constants
+
+Two additional module-level constants in `agents/profile.py` are useful when building subagent profiles:
+
+### REPORT_TO_ORCH
+
+```python title="agents/profile.py"
+REPORT_TO_ORCH = (
+    "Your only reader is the orchestrator, not a human. "
+    "Do not greet, apologize, or recap the task. No markdown headings or filler. "
+    "End with a complete briefing: labeled lines for what / paths / facts / verdict / leftover. "
+    "Facts must be specific enough that a later coder can work without re-surveying. "
+    "A filename is not an answer. Finish the investigation before you report. "
+    "Omit empty fields. If a command or fetch failed for environment reasons "
+    "(missing dependency, auth, network) rather than a code bug, say so in "
+    "leftover instead of retrying blindly."
+)
+```
+
+Append `REPORT_TO_ORCH` to the `system_prompt` of any read-only survey profile (researcher-style agents). It instructs the child never to address the user — its only consumer is the orchestrator — and defines the expected briefing structure. The built-in `researcher` and `ask` profiles both include it.
+
+### EXTRACTOR_MODEL
+
+```python title="agents/profile.py"
+EXTRACTOR_MODEL = "anthropic/claude-haiku-4.5"
+```
+
+The OpenRouter model ID used by the `tester` profile's compaction step. Set `model=EXTRACTOR_MODEL` on any profile where low-cost extraction is acceptable and full reasoning is not required. Profiles that leave `model=None` inherit `OPENROUTER_CHILD_MODEL` (if set) or the session-level `OPENROUTER_MODEL`.
 
 ## Hard constraints vs prompt-only constraints
 

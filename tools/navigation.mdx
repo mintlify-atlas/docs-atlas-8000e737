@@ -46,7 +46,7 @@ Any directory whose name ends with `.egg-info` or `.dist-info`, or whose name st
 
 A newline-separated string of relative paths, e.g.:
 
-```
+```text
 src/main.py
 src/models/user.py
 tests/test_main.py
@@ -114,7 +114,7 @@ The tool also records the file's SHA-256 hash in the session's `FileTracker`, wh
 
 ### Return value
 
-```
+```text
 src/main.py  lines 1-200 of 450  (next offset=201)
   1|import sys
   2|from runtime.session import EngineSession
@@ -125,7 +125,7 @@ src/main.py  lines 1-200 of 450  (next offset=201)
 
 When `offset` is past the end of the file:
 
-```
+```text
 src/main.py  offset 500 is past end (450 lines)
 ```
 
@@ -190,7 +190,7 @@ Runs [ripgrep](https://github.com/BurntSushi/ripgrep) against the workspace and 
 
 ### Return value
 
-```
+```text
 agents/loop.py:42:    def _dispatch(self, cmd: Command) -> None:
 agents/orchestrator.py:18:class Orchestrator:
 runtime/session.py:91:        def _dispatch(self, ...

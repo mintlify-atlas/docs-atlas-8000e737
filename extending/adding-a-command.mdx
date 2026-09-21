@@ -1,7 +1,7 @@
 ---
-title: "Extend the Protocol with a Custom Command"
+title: "Extend the CodeLoom Protocol with a Custom Command"
 sidebarTitle: "Adding a Command"
-description: "Follow the four-step process to add a new client-to-engine protocol command: define a dataclass, write a handler, register the module, and add round-trip tests."
+description: "Add a new client-to-engine protocol command: define a typed dataclass, write a handler with @handles, import the module, and test the codec round-trip."
 ---
 
 Commands are the client-to-engine half of CodeLoom's Unix-socket protocol. Every message the client sends — `StartSession`, `SubmitUserMessage`, `OpenFile`, and so on — is a command. The server-to-client half (events) follows the same decorator pattern in `protocol/events.py`.
@@ -24,6 +24,21 @@ Like tools and profiles, commands are discovered by decorator-based registries �
     Imports every handler module for its side effects. **This is the one manual step** — if you add a new module, import it here so `@handles` decorators run and populate `HANDLERS`.
   </Card>
 </CardGroup>
+
+The registration glue in `runtime/commands/register.py` is intentionally minimal:
+
+```python title="runtime/commands/register.py"
+HANDLERS: dict[type, object] = {}
+
+
+def handles(command_type: type):
+    def deco(fn):
+        HANDLERS[command_type] = fn
+        return fn
+    return deco
+```
+
+`HANDLERS` maps each command class (not its string name — the actual `type` object) to its handler callable. `EngineSession.handle` looks up `HANDLERS[type(command)]` at dispatch time.
 
 ## Minimal complete example
 

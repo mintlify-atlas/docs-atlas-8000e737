@@ -1,7 +1,7 @@
 ---
-title: "Tree-sitter Tools: AST-Based Code Analysis"
+title: "Tree-sitter Tools: AST-Based Code Analysis and Queries"
 sidebarTitle: "Tree-sitter"
-description: "Five offline AST tools for symbol outlines, definition lookup, node inspection, S-expression queries, and compact parse-tree views across Python, Go, JS, and TS."
+description: "Five offline AST tools for symbol outlines, definition lookup, node inspection, S-expression queries, and compact parse-tree views — no LSP needed."
 ---
 
 The tree-sitter tools parse source files locally using embedded grammars — no language server is needed. They run instantly on any supported file type and are the right first choice when you need to locate definitions, inspect syntax structure, or run structural queries without waiting for an LSP warm-start.
@@ -79,7 +79,7 @@ Produces a hierarchical outline of all definitions (functions, classes, methods,
 
 ### Return value
 
-```
+```text
 14 symbol(s) in agents/loop.py
 import from agents.base  agents/loop.py:1:1
 import from protocol.commands  agents/loop.py:2:1
@@ -117,7 +117,7 @@ Searches the file's AST for a top-level or nested definition matching `symbol` b
 
 ### Return value
 
-```
+```text
 Found 'AgentLoop' at agents/loop.py:12:7 (pass this line/character to goto_definition, find_references, or hover)
 
 class AgentLoop:
@@ -158,7 +158,7 @@ Returns structural information about the tree-sitter node covering the 1-based `
 
 ### Return value
 
-```
+```text
 agents/loop.py:22:9
 type: function_definition
 name: run
@@ -220,7 +220,7 @@ Prefer presets over raw queries — the engine maintains them per language and t
 
 ### Return value
 
-```
+```text
 6 capture(s) for functions in agents/loop.py
 agents/loop.py:12:1  class_definition  class AgentLoop:
 agents/loop.py:22:5  function_definition  def run(self) -> None:
@@ -262,7 +262,7 @@ Produces a compact, indented tree of named AST nodes — showing node types, opt
 
 ### Return value
 
-```
+```text
 8 named node(s) in runtime/config.py
 module  runtime/config.py:1:1-312
   class_definition EngineConfig  runtime/config.py:14:1-80

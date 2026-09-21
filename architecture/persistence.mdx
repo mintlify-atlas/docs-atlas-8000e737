@@ -1,7 +1,7 @@
 ---
-title: "Persistence: SQLite Snapshots and Memory Store"
+title: "Persistence: SQLite Session Snapshots and Memory Store"
 sidebarTitle: "Persistence"
-description: "A complete guide to the .engine/ directory layout, the SQLite sessions and edits tables, the memory.json knowledge store, and what survives a server restart."
+description: "Complete guide to the .engine/ directory layout, SQLite sessions and edits tables, the memory.json knowledge store, and what survives a server restart."
 ---
 
 CodeLoom Engine writes all persistent state under a single `.engine/` directory at the workspace root. This directory is the only place the engine touches outside the workspace files it edits. Understanding its contents tells you exactly what survives a server restart, what you can safely delete to reset state, and what the reconnection flow replays.
@@ -10,16 +10,18 @@ CodeLoom Engine writes all persistent state under a single `.engine/` directory 
 
 ```text
 .engine/
-├── engine.sock          # Unix domain socket (deleted on clean shutdown)
-├── session.db           # SQLite database: sessions table + edits table
-├── memory.json          # Structured workspace knowledge (files + decisions)
-├── mcp-tokens.json      # Encrypted tokens for authenticated MCP servers
-├── trace.jsonl          # Per-call trace log (only if ENGINE_TRACE_CALLS=true)
-├── skills/              # Custom SKILL.md directories
+├── engine.sock             # Unix domain socket (deleted on clean shutdown)
+├── session.db              # SQLite database: sessions table + edits table
+├── memory.json             # Structured workspace knowledge (files + decisions)
+├── mcp.json                # MCP server enable/disable overrides (per-workspace)
+├── mcp-tokens.json         # Encrypted tokens for authenticated MCP servers
+├── cost-correction.json    # Optional cost backfill for sessions with missing usage
+├── trace.jsonl             # Per-call trace log (only if ENGINE_TRACE_CALLS=true)
+├── skills/                 # Custom SKILL.md directories
 │   └── {name}/
 │       └── SKILL.md
-└── worktrees/           # Git worktrees for active writer agents
-    └── {agent_id}/      # Isolated checkout on engine/{profile}/{agent_id}
+└── worktrees/              # Git worktrees for active writer agents
+    └── {agent_id}/         # Isolated checkout on engine/{profile}/{agent_id}
 ```
 
 <CardGroup cols={2}>

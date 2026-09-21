@@ -1,7 +1,7 @@
 ---
 title: "File Editing Tools: Modify Code with Safety Guarantees"
 sidebarTitle: "Editing"
-description: "Nine editing tools route every write through a safety funnel: syntax gate, FileTracker staleness check, atomic replace, and session journal for undo."
+description: "Eight editing tools route every write through a safety funnel: syntax gate, FileTracker staleness check, atomic replace, and session journal for undo."
 ---
 
 All file modifications in CodeLoom Engine pass through a single write funnel (`runtime/tools/edits.py`). The funnel enforces three invariants before any byte hits disk: the file must have been read in this session (FileTracker), the syntax gate must not introduce new parse errors, and the write is atomic via a `rename(2)` to a temp file. Every committed edit is journaled for `undo_edit`.
@@ -284,7 +284,7 @@ A text block with one record per edit, or `(no edits this session)` when the jou
 
 ### Example output
 
-```
+```text
 #12  edit  src/main.py  str_replace  2025-01-15T10:22:01Z
 --- a/src/main.py
 +++ b/src/main.py

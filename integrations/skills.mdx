@@ -1,7 +1,7 @@
 ---
-title: "Package Agent Instructions as Reusable Skills"
+title: "Package Agent Instructions as Reusable Skills in CodeLoom"
 sidebarTitle: "Skills"
-description: "SKILL.md files let you bundle instructions into named packages the engine discovers automatically, with lexical ranking, per-agent activation lifetimes, and jailed sibling file reads."
+description: "Bundle instructions into named SKILL.md packages the engine discovers automatically, with lexical ranking and per-agent activation lifetimes."
 ---
 
 Skills are named instruction bundles that the engine discovers at startup and injects into every agent's context. Each skill is a directory containing a `SKILL.md` file. The model always sees the skill names; it calls `activate_skill` to load a skill's full instructions into its current turn. Clients observe the catalog through `SkillCatalogUpdated` events and can unlock hidden skills session-wide via the `ActivateSkill` command.
@@ -22,7 +22,7 @@ Do not place skills in `~/.cursor/skills-cursor/` — that directory is not scan
 
 A typical layout for a workspace skill:
 
-```
+```text
 .engine/skills/
 └── docs/
     ├── SKILL.md
@@ -72,7 +72,7 @@ The engine renders a skill catalog into every agent's system prompt. The catalog
 
 This ranking is computed by `rank_descriptions()` in `runtime/skills/catalog.py`. Near-ties do not flicker between turns because the sticky set is updated in place.
 
-```
+```text
 Available skills (call activate_skill by name):
 - docs: Write or update markdown docs. Use when the user mentions README or docs.
 - testing: Run and fix failing tests in the test suite.

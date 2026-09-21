@@ -1,7 +1,7 @@
 ---
-title: "Subagent Personalities: Specialized AI Roles"
+title: "Agent Personalities: Specialized AI Subagent Roles"
 sidebarTitle: "Overview"
-description: "How the orchestrator discovers named profiles, spawns them as tools, enforces write boundaries, routes worktree isolation, and compacts each child's result into an AgentResult."
+description: "Profile discovery, spawn-as-tool mechanics, write-glob enforcement, worktree isolation, and AgentResult compaction for the CodeLoom personality system."
 ---
 
 CodeLoom Engine decomposes every user request into focused, single-purpose agents called **personalities**. Rather than one monolithic agent that reads, writes, tests, and searches, the orchestrator selects the right personality for each job and fires it as an async tool call — keeping each child sandboxed by its capabilities and its write boundaries. This page describes the full personality system: how profiles are discovered, how they become spawn tools, what constraints each type enforces, and what comes back when they finish.
@@ -59,10 +59,12 @@ Each profile declares exactly which tools it may call via `tool_names`. The orch
 | `GH_READ` | All `GH_SOCIAL` + `GH_REPO` tools (PR/issue/run/release read + repo/tree/file/compare/search) |
 | `GH_WRITE` | `gh_pr_comment`, `gh_issue_create` |
 | `HTTP` | `http_request`, `openapi_ops` |
+| `OPENAPI` | `openapi_ops` |
 | `ENV` | `runtime_info` |
 | `SCAN` | `todo_scan` |
 | `DEP` | `dep_why` |
 | `PKG` | `pkg_info` |
+| `TLDR` | `tldr` |
 | `DOCS` | `docs_lookup`, `tldr` |
 | `SEC` | `osv_query` |
 | `SKILLS` | `activate_skill`, `read_skill` |
@@ -94,11 +96,17 @@ Two profile flags control git worktree routing:
 
 After a writer finishes, the orchestrator asks the user to **merge**, **open a PR**, **keep**, or **discard** the worktree. The `settle_worktree` tool (also registered on the orchestrator) drives this flow by calling `apply_worktree()` in `runtime/tools/git.py`.
 
-## Spawn budget (max\_spawns\_per\_turn)
+## Spawn budget and survey-once guard
 
 The orchestrator tracks live children with `_live_spawn_count()`. When that count reaches `spawn_budget` (default `8`), `spawn()` returns `"error: spawn budget exhausted"` and no new child is started. The budget resets with `reset_spawn_budget()`.
 
-Survey-once profiles (`ask` and `researcher`) are additionally limited to one spawn per user message. A second attempt on the same turn returns `"error: already spawned … this user message; answer with what you have or ask the user"`. An `incomplete` status on those profiles arms a single retry, tracked via `_survey_retry`.
+Survey-once profiles are additionally limited to one spawn per user message. The set is defined as:
+
+```python title="agents/orchestrator.py"
+_SURVEY_ONCE = frozenset({"ask", "researcher"})
+```
+
+A second spawn attempt for either profile on the same turn returns `"error: already spawned … this user message; answer with what you have or ask the user"`. An `incomplete` status on those profiles arms a single retry, tracked via `_survey_retry`.
 
 ## REPORT\_TO\_ORCH and the briefing format
 

@@ -1,5 +1,5 @@
 ---
-title: "LSP Tools: Type-Aware Code Intelligence"
+title: "LSP Tools: Type-Aware Code Intelligence for Agents"
 sidebarTitle: "LSP"
 description: "Six language-server tools for go-to-definition, cross-file references, hover types, diagnostic squiggles, symbol outlines, and safe multi-file renames."
 ---
@@ -89,7 +89,7 @@ Jumps to the definition of the symbol at the given position. Unlike `find_symbol
 
 ### Return value
 
-```
+```text
 runtime/config.py:14:7  class EngineConfig:
 ```
 
@@ -153,7 +153,7 @@ The raw hover content string from the server (Markdown or plain text). Returns `
 
 ### Example
 
-```
+```text
 (method) AgentLoop.run() -> None
 
 Run the agent loop until the session ends or the turn limit is reached.
@@ -177,7 +177,7 @@ Returns all errors, warnings, info, and hint diagnostics for `path` as reported 
 
 ### Return value
 
-```
+```text
 runtime/config.py:42:5 Error: [pyright] Cannot access attribute "timeout" for class "EngineConfig"
 runtime/config.py:78:9 Warning: [pyright] Variable "x" is not used
 ```
@@ -204,7 +204,7 @@ Prefer `list_symbols` (tree-sitter) first. Use `document_symbols` when the tree-
 
 ### Return value
 
-```
+```text
 14 symbol(s) in runtime/config.py
 Class EngineConfig  14:7
   Method __init__  15:9

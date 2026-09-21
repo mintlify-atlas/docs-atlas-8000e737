@@ -1,7 +1,7 @@
 ---
-title: "How the Agent Loop Drives LLM and Tool Turns"
+title: "How the Agent Loop Drives LLM Turns and Tool Calls"
 sidebarTitle: "Agent Loop"
-description: "A deep dive into AgentLoop.run(), turn budgets, concurrent tool dispatch, context compaction strategies, the Orchestrator/Subagent split, and every AgentHooks callback."
+description: "Deep dive into AgentLoop.run(), turn budgets, tool dispatch, compaction strategies, the Orchestrator/Subagent split, and every AgentHooks callback."
 ---
 
 Every agent in CodeLoom Engine — whether the user-facing orchestrator or a background `coder` subagent — runs the same core machinery: `AgentLoop` in `agents/agent_loop.py`. Understanding this class is understanding how the engine drives the LLM, manages turn budgets, dispatches tools, and compresses context when conversations grow long. The `Orchestrator` and `Subagent` classes extend `AgentLoop` with exactly the responsibilities their names imply: one coordinates personality spawning, the other runs a single task to completion.
@@ -148,7 +148,7 @@ The `compact()` function in `agents/compactor.py` applies strategies in order fr
 </Steps>
 
 <Warning>
-  Subagents use `CHILD_COMPACT_TRIGGER = 2.0`, which effectively **disables in-loop compaction** for children — the trigger ratio can never be reached. Children instead rely on `compress_for_parent` to summarise their full transcript into an `AgentResult` at the end of the task.
+  Subagents use `CHILD_COMPACT_TRIGGER = 2.0` and `CHILD_KEEP_FULL_TOOLS = 10` (both from `runtime/config.py`). The high trigger ratio effectively **disables in-loop compaction** for children — the ratio can never be reached under normal token budgets. Children instead rely on `compress_for_parent` to summarise their full transcript into an `AgentResult` at the end of the task.
 </Warning>
 
 ## Orchestrator vs Subagent
@@ -185,15 +185,15 @@ After the child finishes, `commit_if_dirty` commits any uncommitted edits on the
 # agents/hooks.py
 @dataclass
 class AgentHooks:
-    on_tool: Callable[..., None] | None = None        # tool finished
-    on_tool_start: Callable[...] | None = None        # tool started
-    on_delta: Callable[[str, str, str], None] | None = None   # streaming text chunk
-    on_message_start: Callable[[str], None] | None = None     # new message ID
-    on_message: Callable[[str, str], None] | None = None      # full message (children only)
-    on_usage: Callable[..., None] | None = None       # token/cost accounting
-    on_llm_request: Callable[...] | None = None       # LLM request latency
-    on_state: Callable[[str, int, int], None] | None = None   # state machine transitions
-    on_compact: Callable[[dict], None] | None = None  # compaction info
+    on_tool: Callable[..., None] | None = None                        # tool finished
+    on_tool_start: Callable[[str, str, dict], None] | None = None     # tool started
+    on_delta: Callable[[str, str, str], None] | None = None           # streaming text chunk
+    on_message_start: Callable[[str], None] | None = None             # new message ID
+    on_message: Callable[[str, str], None] | None = None              # full message (children only)
+    on_usage: Callable[..., None] | None = None                       # token/cost accounting
+    on_llm_request: Callable[[str, float, bool], None] | None = None  # LLM request latency
+    on_state: Callable[[str, int, int], None] | None = None           # state machine transitions
+    on_compact: Callable[[dict], None] | None = None                  # compaction info
 ```
 
 <Accordion title="Callback reference">

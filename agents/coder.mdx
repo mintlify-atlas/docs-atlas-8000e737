@@ -1,7 +1,7 @@
 ---
 title: "Coder Agent: Implement Changes in Isolated Worktrees"
 sidebarTitle: "Coder"
-description: "The coder profile applies targeted code edits inside a dedicated git worktree, must call get_diagnostics before finishing, and never merges or pushes — the user decides what to do with the branch."
+description: "Edits code in an isolated git worktree. Requires get_diagnostics before finishing. Never merges or pushes — the user picks merge, pr, keep, or discard."
 ---
 
 Once the orchestrator has paths and facts (from workspace memory or an `ask` briefing), it hands the implementation work to the **coder** personality. Coder operates in a dedicated git worktree so its changes are completely isolated from the user's main checkout. It has access to every editing, shell, LSP, and git tool it needs — but it cannot search the internet, cannot open a PR itself, and cannot finish without calling `get_diagnostics` on the files it changed.

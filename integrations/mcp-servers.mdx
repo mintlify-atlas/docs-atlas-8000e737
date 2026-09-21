@@ -1,7 +1,7 @@
 ---
-title: "Connect MCP Servers to CodeLoom Engine"
+title: "Connect and Configure MCP Servers in CodeLoom Engine"
 sidebarTitle: "MCP Servers"
-description: "Configure external tool servers via .engine/mcp.json, handle OAuth token auth, scope servers to agent profiles, and control them with ReloadIntegrations and SetMcpEnabled."
+description: "Configure stdio MCP servers in .engine/mcp.json, scope tools to agent profiles, handle token auth, and control servers with ReloadIntegrations."
 ---
 
 CodeLoom Engine acts as a Model Context Protocol (MCP) **client**. It launches external tool servers as child processes over `stdio`, bridges their tools into the agent tool registry, and exposes them to agents through a family-scoped allowlist. Clients never speak MCP directly — they configure servers in JSON, respond to auth events, and observe status through `McpServersUpdated` events.
@@ -134,7 +134,7 @@ The engine does not open a browser. When a server needs authentication, the sequ
 `.engine/mcp-tokens.json` is created with mode `0600` and should be added to `.gitignore` alongside the entire `.engine/` directory.
 </Note>
 
-If a server that was previously authenticated later returns a 401, the engine sets `status=needs_auth` and `error="token rejected; CompleteMcpAuth"`. Use `CompleteMcpAuth` to supply a fresh token — there is no need to call `ReloadIntegrations` in this case.
+If a server that was previously authenticated later returns an authentication error (such as `401`, `unauthorized`, `invalid_token`, `forbidden`, or `login required`), the engine sets `status=needs_auth` and `error="token rejected; CompleteMcpAuth"`. Use `CompleteMcpAuth` to supply a fresh token — there is no need to call `ReloadIntegrations` in this case.
 
 Without `tokenEnv`, the engine emits `McpAuthRequired` and a warning, but cannot store a token. You must inject the credential manually into the environment before starting the session.
 

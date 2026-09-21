@@ -1,5 +1,5 @@
 ---
-title: "What is CodeLoom Engine?"
+title: "Introduction to CodeLoom Engine: Headless Agent Backend"
 sidebarTitle: "Introduction"
 description: "CodeLoom Engine: a headless agent backend where clients speak typed JSON over a Unix socket and never touch agent internals or the tool registry."
 ---
@@ -22,7 +22,7 @@ The payoff of this separation is a **paranoid write path**. Because every file e
 
 The engine is composed of four layers that stack cleanly on top of one another:
 
-```
+```text
 Client(s) — NDJSON over AF_UNIX
        │
        ▼

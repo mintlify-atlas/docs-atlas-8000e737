@@ -1,7 +1,7 @@
 ---
-title: "Web and HTTP Tools: Search, Fetch, and Call APIs"
+title: "Web and HTTP Tools: Search, Fetch, and Call REST APIs"
 sidebarTitle: "Web & HTTP"
-description: "Ten tools covering Brave web search, HTML-to-markdown fetch, typed HTTP requests, OpenAPI exploration, official docs lookup, vulnerability scanning, and runtime info."
+description: "Ten tools for Brave web search, HTML-to-markdown fetch, typed HTTP requests, OpenAPI exploration, docs lookup, vulnerability scanning, and runtime info."
 ---
 
 The web and HTTP tools let agents reach external information sources without leaving the engine. All network tools enforce scheme restrictions (`http`/`https` only) and block cloud-metadata endpoints. Mutating HTTP methods require approval; `GET` and `HEAD` are free.
@@ -61,7 +61,7 @@ Performs a web search using the [Brave Search API](https://brave.com/search/api/
 
 ### Return value
 
-```
+```text
 [1] Python asyncio — official docs
 url: https://docs.python.org/3/library/asyncio.html
 The asyncio library provides infrastructure for writing single-threaded concurrent code using coroutines.
@@ -91,7 +91,7 @@ Issues an HTTP GET request to `url` and converts HTML responses to readable mark
 
 ### Return value
 
-```
+```text
 title: Python asyncio — docs
 url: https://docs.python.org/3/library/asyncio.html
 
@@ -104,7 +104,7 @@ url: https://docs.python.org/3/library/asyncio.html
 
 `web_fetch` refuses any URL on `github.com` and returns a redirect hint instead:
 
-```
+```text
 error: use github_repo / github_tree / github_file for owner/repo.
  github_file repo=owner/repo path=src/main.py ref=main. Do not web_fetch github.com HTML.
 ```
@@ -149,7 +149,7 @@ Makes a typed HTTP request. `GET` and `HEAD` execute without approval. `POST`, `
 
 ### Return value
 
-```
+```text
 status: 200
 content-type: application/json
 
@@ -186,7 +186,7 @@ Fetches an OpenAPI 2.x/3.x (JSON or YAML) document from `url` and lists all HTTP
 
 ### Return value
 
-```
+```text
 GET /users — List users
 POST /users — Create a user
 GET /users/{id} — Get user by id
@@ -334,7 +334,7 @@ Reports the versions of locally installed tools. Takes no parameters.
 
 ### Return value
 
-```
+```text
 python: 3.12.2
 node: 20.11.0
 go: 1.22.1

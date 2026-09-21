@@ -1,7 +1,7 @@
 ---
 title: "Debugger Agent: Investigate Bugs with LSP and Browser"
 sidebarTitle: "Debugger"
-description: "The debugger profile uses LSP, shell, git history, GitHub CI, and a headless Playwright browser to locate root causes — but never edits files, returning a structured bug report to the orchestrator."
+description: "Locates root causes using LSP, shell, git history, GitHub CI, and a headless browser. Read-only — returns a structured bug report, never edits files."
 ---
 
 When something is broken and the cause is unclear, the **debugger** personality investigates. It has the broadest read-access of any profile — shell execution, git history, LSP, GitHub CI, security advisories, HTTP requests, and a full headless browser — but it does not edit a single file. Its entire output is a structured bug report: repro steps, the failing signal, the suspected locus with paths and function names, and what it did not check.

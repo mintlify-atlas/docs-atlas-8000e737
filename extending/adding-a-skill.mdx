@@ -57,7 +57,7 @@ for source, root in roots:
 
 A skill is a directory. The only required file is `SKILL.md`. Everything else is optional sibling content the agent can fetch with `read_skill(name, path)`.
 
-```
+```text
 .engine/skills/
 └── docs/
     ├── SKILL.md          ← required; frontmatter + body
@@ -111,7 +111,7 @@ def read_skill_file(skill: Skill, rel: str) -> str:
 
 An agent activates the skill body and then fetches a sibling:
 
-```
+```text
 activate_skill("docs")
 # → body of SKILL.md is now in context
 

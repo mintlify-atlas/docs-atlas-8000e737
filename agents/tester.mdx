@@ -1,7 +1,7 @@
 ---
-title: "Tester Agent: Write and Run Tests in Isolation"
+title: "Tester Agent: Write and Run Tests in Isolation Safely"
 sidebarTitle: "Tester"
-description: "The tester profile creates and runs tests in an isolated worktree, is hard-constrained to TEST_GLOBS paths, and must call run_command at least once — it cannot touch production code."
+description: "Creates and runs tests in an isolated worktree, constrained to TEST_GLOBS paths. Must invoke run_command at least once. Cannot touch production code."
 ---
 
 After a coder lands a change, or when the orchestrator needs to verify existing behavior, the **tester** personality takes over. It runs in its own git worktree, just like coder, but it cannot edit production code: its writes are restricted to a strict set of test-file glob patterns. It must actually invoke the test runner via `run_command` and report what happened — a passing hypothesis without a passing command is not a complete result.
@@ -85,7 +85,13 @@ PROFILE = AgentProfile(
 
 ## Model override: EXTRACTOR\_MODEL
 
-Tester is the only built-in profile that overrides the session model. It uses `EXTRACTOR_MODEL = "anthropic/claude-haiku-4.5"` instead of the session's default LLM. This was a deliberate cost decision: the ask briefing is the map the orchestrator and coder run on, and Haiku is an appropriate fit for the more mechanical work of writing and running tests. The comment in `profile.py` explains: *"Ask inherits OPENROUTER\_MODEL — the briefing is the map the orch and coder run on, and Haiku was the wrong place to save money."*
+Tester is the only built-in profile that overrides the session model. It uses `EXTRACTOR_MODEL = "anthropic/claude-haiku-4.5"` instead of the session's default LLM. This is a deliberate cost decision: the test-writing and test-running work is more mechanical than codebase surveying, so the cheaper Haiku model is an appropriate fit. The comment in `profile.py` explains the reasoning by contrast — `ask` keeps the full session model because its briefing is the map the orchestrator and coder run on, and cutting costs there was the wrong tradeoff:
+
+```python title="agents/profile.py"
+# Tester only. Ask inherits OPENROUTER_MODEL — the briefing is the map
+# the orch and coder run on, and Haiku was the wrong place to save money.
+EXTRACTOR_MODEL = "anthropic/claude-haiku-4.5"
+```
 
 ## The required `run_command` call
 

@@ -42,8 +42,11 @@ python scripts/bench_ab.py \
   <Step title="Submit the prompt and wait">
     The prompt is submitted via `dummy_client.py --message --auto` on both sides simultaneously in a `ThreadPoolExecutor`. The client waits until each orchestrator is idle with no live subagents. Pass `--timeout N` for a wall-clock fuse.
   </Step>
-  <Step title="Collect results and print the table">
-    Both engines are stopped gracefully. Stats are loaded from each side's `.engine/session.db` SQLite store, chat transcripts are saved to `logs/`, and the result table is printed and written to `summary.txt`.
+  <Step title="Stop both engines">
+    Both engine processes are stopped gracefully (SIGTERM, 15 s grace, then SIGKILL). Engine stdout/stderr were streamed to `logs/engine-baseline.log` and `logs/engine-judge.log` throughout.
+  </Step>
+  <Step title="Collect results and write artifacts">
+    Stats are loaded from each side's `.engine/session.db` SQLite store. Chat transcripts are written to `logs/transcript-baseline.txt` and `logs/transcript-judge.txt`. The side-by-side result table is printed to the console and saved to `summary.txt` in the workdir.
   </Step>
 </Steps>
 
@@ -101,6 +104,18 @@ After both sides finish, the harness reads each workspace's SQLite snapshot and 
   GitHub pull request URL if the session opened one; empty string otherwise.
 </ResponseField>
 
+<ResponseField name="diffstat" type="str">
+  Human-readable `git diff --shortstat` summary for the workspace and any worktrees under `.engine/worktrees/`, joined by `"; "`. Empty string if no changes.
+</ResponseField>
+
+<ResponseField name="last_reply" type="str">
+  The final non-empty, non-aborted assistant message from the session transcript. Truncated to 800 characters in the printed table.
+</ResponseField>
+
+<ResponseField name="error" type="str">
+  Non-empty if the harness could not load the session snapshot (e.g. `"no session in sqlite"`). An empty string means the side completed without a harness-level error.
+</ResponseField>
+
 ## Auto-answer policy
 
 The headless client (`--auto`) answers interactive prompts automatically so the run never blocks waiting for human input.
@@ -120,7 +135,7 @@ The headless client (`--auto`) answers interactive prompts automatically so the 
 
 After the run completes, the `--workdir` directory contains:
 
-```
+```text
 <workdir>/
   summary.txt               side-by-side result table
   logs/
@@ -181,7 +196,7 @@ The report synthesizes a short narrative from the data: which side was cheaper, 
 
 When `ENGINE_PUSHGATEWAY_URL` is set, both sides push metrics to the same Pushgateway under the same job label but different `instance` values (`baseline` and `judge` by default). Use the dashboard's `instance` filter to compare the two series. The shell table in `summary.txt` is always the authoritative source; Grafana adds timeline visibility for long-running sessions.
 
-```
+```text
 Filter:  job="my-project-engine"
 Series:  instance=baseline  vs.  instance=judge
 Panels:  cost, tokens, turns, tools, elapsed

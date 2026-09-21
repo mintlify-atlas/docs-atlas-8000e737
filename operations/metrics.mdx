@@ -1,7 +1,7 @@
 ---
 title: "Prometheus Metrics and Observability in CodeLoom"
 sidebarTitle: "Metrics"
-description: "How CodeLoom Engine pushes per-session Prometheus gauges and histograms to a Pushgateway, which env vars control the integration, and how trace logging works."
+description: "Per-session Prometheus gauges and histograms pushed to a Pushgateway, the env vars that control the integration, and how trace logging works."
 ---
 
 Every CodeLoom Engine session creates an isolated `EngineMetrics` instance backed by a dedicated `CollectorRegistry`. Metrics accumulate in-process throughout the session and are pushed asynchronously to a Prometheus Pushgateway whenever significant events occur — LLM completions, tool calls, agent spawns and finishes, and session close. No metrics leave the process unless `ENGINE_PUSHGATEWAY_URL` is set; the registry is always available in-process for testing via `EngineMetrics.sample()`.
@@ -66,7 +66,7 @@ Each spawned subagent gets its own labeled series. Labels are `profile` (e.g. `c
 | `engine_agent_spawned{profile, agent_id}` | Gauge | Set to `1` when the agent is spawned |
 | `engine_agent_finished{profile, agent_id, status}` | Gauge | Set to `1` when the agent finishes; `status` reflects the completion outcome |
 | `engine_agent_cost_usd{profile, agent_id}` | Gauge | LLM cost attributed to this agent |
-| `engine_agent_tokens{profile, agent_id, kind}` | Gauge | Token counts attributed to this agent; `kind` ∈ `prompt`, `cached`, `total` |
+| `engine_agent_tokens{profile, agent_id, kind}` | Gauge | Token counts attributed to this agent; `kind` ∈ `prompt`, `completion`, `reasoning`, `cached`, `total` |
 | `engine_agent_requests{profile, agent_id}` | Gauge | LLM requests attributed to this agent |
 | `engine_agent_duration_seconds{profile, agent_id}` | Gauge | Wall time from spawn to finish |
 
@@ -86,13 +86,13 @@ Histograms record duration distributions rather than totals. They are useful for
 
 <Tabs>
   <Tab title="LLM request duration">
-    ```
+    ```promql
     engine_llm_request_duration_seconds{model, profile}
     ```
     Wall time for each `complete()` call, bucketed at `1, 2, 5, 10, 20, 30, 60, 120, 300, 600` seconds. Failed calls are counted separately in `engine_llm_errors`.
   </Tab>
   <Tab title="Tool execution duration">
-    ```
+    ```promql
     engine_tool_duration_seconds{tool, profile}
     ```
     Wall time for each tool execution, bucketed at `0.01, 0.05, 0.1, 0.5, 1, 2, 5, 15, 30, 60, 120` seconds. Also tracked as a count in `engine_tool_calls{tool, profile, ok}`.

@@ -32,7 +32,7 @@ Runs a shell command asynchronously in the workspace. The command executes in a 
 
 ### Return value
 
-```
+```text
 $ pytest tests/
 exit code: 1  (4.2s)
 --- stdout ---
@@ -91,7 +91,7 @@ Reports the current branch, dirty flag, and lists of staged, unstaged, and untra
 
 ### Return value
 
-```
+```text
 branch: main
 dirty: True
 staged: src/main.py
@@ -143,7 +143,7 @@ Returns recent commits in `--oneline` format: `<short-sha> <subject>`.
 
 ### Return value
 
-```
+```text
 a1b2c3d feat: add EngineSession timeout
 e4f5a6b fix: resolve config race condition
 ...
@@ -228,7 +228,7 @@ Shows the commits and file diffstat for the symmetric difference `base...head` â
 
 ### Return value
 
-```
+```text
 commits main...feature/timeout:
 a1b2c3d feat: add configurable session timeout
 e4f5a6b test: cover timeout edge cases

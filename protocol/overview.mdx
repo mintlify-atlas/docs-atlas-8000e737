@@ -1,7 +1,7 @@
 ---
-title: "NDJSON Wire Protocol Over Unix Domain Socket"
+title: "CodeLoom Engine Wire Protocol: NDJSON Over Unix Socket"
 sidebarTitle: "Overview"
-description: "Clients connect to a Unix domain socket and exchange newline-delimited JSON messages — commands going in, events coming out — with no access to engine internals."
+description: "Clients open a Unix socket and speak newline-delimited JSON. Commands drive the engine; events fan out to all subscribers simultaneously."
 ---
 
 CodeLoom Engine exposes a strict process boundary: every message that crosses the socket is a typed JSON object, and nothing else ever does. Clients send **commands** to drive the engine, and the engine broadcasts **events** back to every connected subscriber. Because the transport is a plain Unix domain socket carrying newline-delimited JSON, any language that can open a socket and parse a line of JSON can drive a full AI coding agent without importing a single Python module.
@@ -10,7 +10,7 @@ CodeLoom Engine exposes a strict process boundary: every message that crosses th
 
 The engine binds a **Unix domain socket** (`AF_UNIX`) at a well-known path inside the workspace's `.engine` directory:
 
-```
+```text
 {workspace}/.engine/engine.sock
 ```
 
