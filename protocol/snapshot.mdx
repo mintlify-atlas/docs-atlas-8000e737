@@ -1,0 +1,304 @@
+---
+title: "EngineSnapshot: Full Session State on Reconnect"
+sidebarTitle: "Snapshot"
+description: "Reference for EngineSnapshot and every sub-type it carries — ChatMessage, GitState, Stats, AgentRow, and more — plus which fields are stripped when a session is persisted."
+---
+
+`EngineSnapshot` is the reconnect payload. Every time a client sends `StartSession` or `RequestSnapshot`, the engine builds a snapshot of the entire live session and delivers it inside a `SnapshotReady` event. The snapshot is the single source of truth for initialising or refreshing client-side state — chat history, open files, git status, active agents, integrations, and usage statistics, all in one message.
+
+<Info>
+  `EngineSnapshot` and all its sub-types are defined in `protocol/snapshot.py`. Serialisation is handled by `to_json` / `from_json` methods on each dataclass — there is no third-party serialisation library involved.
+</Info>
+
+---
+
+## `EngineSnapshot`
+
+The top-level reconnect payload delivered inside every `SnapshotReady` event.
+
+<Note>
+  The `messages` field is always **empty** in a `SnapshotReady` event. History
+  is streamed separately as `ChatHistoryAdded` events (with `ChatHistoryComplete`
+  at the end) to avoid blocking the event loop on large histories. Use
+  `message_count` to size the UI before history arrives.
+</Note>
+
+<ResponseField name="session_id" type="string" required>
+  Unique session UUID. Pass this back in `StartSession` to resume the session.
+</ResponseField>
+<ResponseField name="workspace" type="string" required>
+  Absolute path to the project root this session is bound to.
+</ResponseField>
+<ResponseField name="messages" type="ChatMessage[]" required>
+  Always empty in `SnapshotReady`. Use `message_count` to size UI, then wait for
+  `ChatHistoryAdded` / `ChatHistoryComplete` replay.
+</ResponseField>
+<ResponseField name="ended" type="boolean" required>
+  `true` if the session has been cleanly shut down and persisted. A resumed
+  session starts with `ended=false` regardless of how it was last saved.
+</ResponseField>
+<ResponseField name="open_files" type="string[]" required>
+  Workspace-relative paths currently in the open-file set. A `FileContent` event
+  for each is emitted during full snapshot replay.
+</ResponseField>
+<ResponseField name="file_tree" type="FileTreeNode[]" required>
+  Recursive workspace file tree. Populated during `SnapshotReady` but **stripped
+  on persistence** — see [Persistence](#what-is-stripped-on-persistence).
+</ResponseField>
+<ResponseField name="git" type="GitState" required>
+  Current git state. Populated in `SnapshotReady` but **stripped on persistence**.
+</ResponseField>
+<ResponseField name="language" type="string | null">
+  Detected primary language of the workspace (e.g. `"python"`, `"go"`,
+  `"typescript"`). `null` if not yet detected or unsupported.
+</ResponseField>
+<ResponseField name="language_supported" type="boolean">
+  `true` if the detected language has a configured tree-sitter grammar and
+  language server.
+</ResponseField>
+<ResponseField name="message_count" type="integer">
+  Total number of messages in history (including those not yet replayed).
+  Available immediately in `SnapshotReady` before any `ChatHistoryAdded` arrives.
+</ResponseField>
+<ResponseField name="file_tree_count" type="integer">
+  Total number of nodes in `file_tree` (files + directories). Computed
+  recursively via `_tree_count`.
+</ResponseField>
+<ResponseField name="stats" type="Stats">
+  Cumulative usage statistics for this session. See [Stats](#stats).
+</ResponseField>
+<ResponseField name="pending_prompt" type="PendingPrompt | null">
+  If an agent was waiting for a user response when the client disconnected,
+  this field carries the unresolved prompt so the reconnecting client can
+  re-display it. **Stripped on persistence** — see below.
+</ResponseField>
+<ResponseField name="agents" type="AgentRow[]">
+  Live subagent rows at the time of snapshot. **Stripped on persistence.**
+</ResponseField>
+<ResponseField name="mcp_servers" type="McpServerRow[]">
+  Configured MCP servers and their current status. See [McpServerRow](#mcpserverrow).
+</ResponseField>
+<ResponseField name="skills" type="SkillRow[]">
+  Discovered skills in the skill catalog. See [SkillRow](#skillrow).
+</ResponseField>
+
+---
+
+## `ChatMessage`
+
+A single entry in the session's chat history.
+
+<ResponseField name="id" type="string" required>Unique message UUID.</ResponseField>
+<ResponseField name="role" type="string" required>
+  `user`, `assistant`, `engine` (child-agent report), or `tool` (tool preview,
+  truncated to 400 chars).
+</ResponseField>
+<ResponseField name="text" type="string" required>Full message text.</ResponseField>
+<ResponseField name="ts" type="string" required>ISO-8601 UTC creation timestamp.</ResponseField>
+
+---
+
+## `SessionSummary`
+
+A lightweight record returned in `SessionList`. Contains just enough information to display a session picker.
+
+<ResponseField name="id" type="string" required>Session UUID.</ResponseField>
+<ResponseField name="saved_at" type="string" required>ISO-8601 UTC timestamp of the most recent `save` operation.</ResponseField>
+<ResponseField name="message_count" type="integer" required>Number of messages in the persisted history.</ResponseField>
+<ResponseField name="open_files" type="string[]" required>Workspace-relative paths that were open when the session was last saved.</ResponseField>
+
+---
+
+## `FileTreeNode`
+
+One node in the recursive workspace file tree. Directories have a non-null `children` list; files have `children=null`.
+
+<ResponseField name="name" type="string" required>File or directory name (basename only).</ResponseField>
+<ResponseField name="path" type="string" required>Workspace-relative path (e.g. `src/auth/tokens.py`).</ResponseField>
+<ResponseField name="is_dir" type="boolean" required>`true` for directories; `false` for files.</ResponseField>
+<ResponseField name="children" type="FileTreeNode[] | null">
+  Recursive child nodes for directories. `null` for file nodes and for
+  directories whose children were not loaded.
+</ResponseField>
+
+<Tip>
+  Walk the tree recursively by checking `is_dir` and `children`. The engine
+  skips `.git`, `.engine`, `__pycache__`, `node_modules`, `.venv`, and other
+  cache directories — `file_tree_count` reflects only the nodes that were
+  actually traversed.
+</Tip>
+
+---
+
+## `GitState`
+
+A point-in-time snapshot of the workspace's git status, including full diffs.
+
+<ResponseField name="branch" type="string | null">Current branch name, or `null` if the workspace is not a git repo or is in a detached HEAD state.</ResponseField>
+<ResponseField name="dirty" type="boolean" required>`true` if there are any staged or unstaged changes.</ResponseField>
+<ResponseField name="staged" type="string[]" required>Workspace-relative paths with staged changes.</ResponseField>
+<ResponseField name="unstaged" type="string[]" required>Workspace-relative paths with unstaged (but tracked) changes.</ResponseField>
+<ResponseField name="untracked" type="string[]" required>Workspace-relative paths of untracked files.</ResponseField>
+<ResponseField name="staged_diff" type="string" required>Full unified diff of all staged changes (`git diff --cached`).</ResponseField>
+<ResponseField name="unstaged_diff" type="string" required>Full unified diff of all unstaged tracked changes (`git diff`).</ResponseField>
+
+---
+
+## `Stats`
+
+Cumulative token usage and cost counters for the entire session, updated after every LLM request and delivered via `StatsUpdated` events and inside `EngineSnapshot`.
+
+<ResponseField name="prompt_tokens" type="integer">Total prompt tokens sent across all LLM requests.</ResponseField>
+<ResponseField name="completion_tokens" type="integer">Total completion tokens received.</ResponseField>
+<ResponseField name="reasoning_tokens" type="integer">Reasoning tokens (chain-of-thought), if reported by the model.</ResponseField>
+<ResponseField name="cached_tokens" type="integer">Prompt tokens served from cache (not billed).</ResponseField>
+<ResponseField name="total_tokens" type="integer">Sum of prompt and completion tokens.</ResponseField>
+<ResponseField name="cost" type="number">Cumulative estimated cost in USD.</ResponseField>
+<ResponseField name="requests" type="integer">Number of LLM API requests made.</ResponseField>
+<ResponseField name="tool_calls" type="integer">Total tool invocations across all agents.</ResponseField>
+<ResponseField name="turns" type="integer">Total agent turns completed.</ResponseField>
+<ResponseField name="elapsed_s" type="number">Wall-clock seconds the session has been active.</ResponseField>
+<ResponseField name="last_turn_tokens" type="integer">Token count for the most recent turn (useful for per-turn cost display).</ResponseField>
+<ResponseField name="last_turn_cost" type="number">Cost in USD for the most recent turn.</ResponseField>
+<ResponseField name="agent_runs" type="AgentRun[]">
+  Per-agent cost breakdown (capped at the last 20 runs). Each entry has:
+  `agent_id`, `profile`, `cost`, `prompt_tokens`, `cached_tokens`,
+  `total_tokens`, `requests`.
+</ResponseField>
+
+---
+
+## `AgentRow`
+
+A live agent record inside `EngineSnapshot.agents` and `AgentsUpdated` events. Represents the current state of one active subagent.
+
+<ResponseField name="id" type="string" required>Unique agent UUID.</ResponseField>
+<ResponseField name="role" type="string" required>`orchestrator` or `subagent`.</ResponseField>
+<ResponseField name="profile" type="string" required>Personality name (e.g. `coder`, `ask`, `tester`, `reviewer`, `researcher`, `debugger`).</ResponseField>
+<ResponseField name="status" type="string" required>Current status: `idle`, `thinking`, `calling_tool`, `waiting_for_user`, `aborting`, or `compacting`.</ResponseField>
+<ResponseField name="current_tool" type="string">Name of the tool currently being called, if `status` is `calling_tool`. Empty otherwise.</ResponseField>
+<ResponseField name="parent_id" type="string">Agent ID of the spawning orchestrator. Empty for the root orchestrator.</ResponseField>
+<ResponseField name="worktree" type="string">Absolute path of the git worktree for writer agents. Empty for read-only agents.</ResponseField>
+<ResponseField name="branch" type="string">Git branch inside the worktree (e.g. `engine/coder/abc123`).</ResponseField>
+<ResponseField name="task" type="string">Natural-language task description assigned at spawn time.</ResponseField>
+<ResponseField name="batch_id" type="string">Groups agents spawned in the same orchestrator reply.</ResponseField>
+<ResponseField name="batch_name" type="string">Human-readable nickname for this batch.</ResponseField>
+
+---
+
+## `PendingPrompt`
+
+Captures an unanswered `UserPromptRequested` at snapshot time, so a reconnecting client can re-display it without losing the interaction.
+
+<ResponseField name="prompt_id" type="string" required>Unique prompt UUID. Pass to `AnswerPrompt`.</ResponseField>
+<ResponseField name="question" type="string" required>The question or description shown to the user.</ResponseField>
+<ResponseField name="kind" type="string" required>`"text"` for free-form input; `"choice"` for a selection from `choices`.</ResponseField>
+<ResponseField name="choices" type="string[]" required>Valid option strings for `"choice"` kind. Empty for `"text"` kind.</ResponseField>
+<ResponseField name="default" type="string | null">Pre-selected answer if the user accepts without typing.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent waiting for the answer; empty for orchestrator-level prompts.</ResponseField>
+
+---
+
+## `McpServerRow`
+
+Status of one configured MCP server, as delivered in `EngineSnapshot.mcp_servers` and `McpServersUpdated` events.
+
+<ResponseField name="name" type="string" required>Server name as declared in `.engine/mcp.json`.</ResponseField>
+<ResponseField name="status" type="string" required>Connection status: `connected`, `connecting`, `error`, or `disabled`.</ResponseField>
+<ResponseField name="transport" type="string">Transport mechanism: `"stdio"` (default) or `"http"`.</ResponseField>
+<ResponseField name="tool_count" type="integer">Number of tools exposed by this server. `0` if not yet connected.</ResponseField>
+<ResponseField name="error" type="string">Error message if `status` is `error`. Omitted when empty.</ResponseField>
+
+---
+
+## `SkillRow`
+
+One entry from the skill catalog, as delivered in `EngineSnapshot.skills` and `SkillCatalogUpdated` events.
+
+<ResponseField name="name" type="string" required>Skill directory name (also the value to pass to `ActivateSkill`).</ResponseField>
+<ResponseField name="description" type="string" required>One-line description extracted from `SKILL.md`.</ResponseField>
+<ResponseField name="source" type="string" required>Absolute path to the skill directory (under `.engine/skills/` or `.cursor/skills/`).</ResponseField>
+<ResponseField name="auto" type="boolean">
+  `true` if the skill is automatically activated at session start; `false` if it
+  must be explicitly activated via `ActivateSkill`.
+</ResponseField>
+
+---
+
+## `ContextSection`
+
+One named section of an agent's context window, delivered in `ContextBreakdown` events.
+
+<ResponseField name="name" type="string" required>Section label (e.g. `"system"`, `"memory"`, `"open_files"`, `"history"`).</ResponseField>
+<ResponseField name="chars" type="integer">Character count of this section.</ResponseField>
+<ResponseField name="tokens_est" type="integer">Estimated token count (derived as `chars ÷ 4` when not provided directly).</ResponseField>
+<ResponseField name="text" type="string">Section text content. May be empty if the caller did not request full text.</ResponseField>
+
+---
+
+## `MemoryFileNote`
+
+A persistent note about a specific workspace file, stored in the memory layer and delivered in `MemoryUpdated` events.
+
+<ResponseField name="path" type="string" required>Workspace-relative file path this note describes.</ResponseField>
+<ResponseField name="purpose" type="string">What the file does — a one-paragraph description.</ResponseField>
+<ResponseField name="entry_points" type="string">Key public symbols, functions, or classes in the file.</ResponseField>
+<ResponseField name="constraints" type="string">Invariants, restrictions, or gotchas the agent should know about.</ResponseField>
+<ResponseField name="note" type="string">Free-form annotation.</ResponseField>
+<ResponseField name="stale" type="boolean">`true` if the file's on-disk SHA no longer matches the SHA recorded when the note was written.</ResponseField>
+<ResponseField name="action" type="string">Last write action: `"upsert"`, `"delete"`, etc.</ResponseField>
+<ResponseField name="updated_at" type="string">ISO-8601 UTC timestamp of the last update.</ResponseField>
+
+---
+
+## `MemoryDecision`
+
+A recorded engineering, product, CI/CD, or other decision, delivered in `MemoryUpdated` events.
+
+<ResponseField name="text" type="string" required>The decision text.</ResponseField>
+<ResponseField name="updated_at" type="string">ISO-8601 UTC timestamp of when the decision was recorded.</ResponseField>
+
+---
+
+## What is stripped on persistence
+
+When a session is saved to SQLite (`{workspace}/.engine/session.db`), several snapshot fields are **removed from the stored JSON** because they represent live runtime state that must be re-hydrated from the environment on the next `StartSession`:
+
+| Field | Why it is stripped |
+|---|---|
+| `file_tree` | Re-read from disk on every session start. |
+| `git` | Re-read from the git index on every session start. |
+| `language` | Re-detected from the workspace on every session start. |
+| `language_supported` | Derived from `language` after detection. |
+| `pending_prompt` | Any unanswered prompt cannot be resumed — the agent it was waiting for is gone. |
+| `agents` | Subagents do not survive a restart; their `AgentRow` entries are always empty on resume. |
+
+The fields that **are** persisted and restored on resume:
+
+- `session_id`, `workspace`
+- `messages` (full chat history, orchestrator only)
+- `open_files`
+- `ended`
+- `stats`
+- `mcp_servers`, `skills`
+
+<Note>
+  Subagent transcripts (`RequestAgentTranscript`) are **not** rehydrated on
+  session resume. Tool messages and child agent histories exist only for the
+  lifetime of the process that generated them.
+</Note>
+
+### SQLite schema
+
+Sessions are stored in a single `sessions` table:
+
+```sql title="{workspace}/.engine/session.db"
+CREATE TABLE sessions (
+  id         TEXT PRIMARY KEY,
+  json       TEXT NOT NULL,   -- stripped EngineSnapshot JSON
+  created_at TEXT NOT NULL,   -- ISO-8601 UTC
+  saved_at   TEXT NOT NULL    -- ISO-8601 UTC, updated on every save
+);
+```
+
+`save()` uses an `INSERT … ON CONFLICT DO UPDATE` so every `Shutdown` is an upsert. `load()` returns `None` for an unknown `session_id` rather than raising, so `StartSession` with a stale ID silently creates a new session.

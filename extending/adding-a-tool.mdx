@@ -1,0 +1,349 @@
+---
+title: "Add a Custom Tool to the CodeLoom Engine"
+sidebarTitle: "Adding a Tool"
+description: "Learn how to create a new LLM-callable tool using the @tool decorator, the two-file split pattern, and the engine's automatic discovery system."
+---
+
+Tools are the primitives the agent loop calls. Every tool the engine ships follows the same pattern: a thin LLM-facing wrapper in `tools/` that holds the schema and description, paired with real logic in `runtime/tools/` that touches disk, runs processes, or queries tree-sitter. This split keeps the schema layer independently testable and free of framework dependencies.
+
+The engine discovers tools automatically. Drop a module under `tools/`, decorate a function with `@tool`, and the engine picks it up on the next start — or immediately in a test via `discover_tools()`. There is no registry file to edit.
+
+<CardGroup cols={2}>
+  <Card title="tools/ — schema layer" icon="tag">
+    Defines the `@tool` decorator, description, and JSON parameter schema. Calls into `runtime/tools/` for the real work.
+  </Card>
+  <Card title="runtime/tools/ — logic layer" icon="wrench">
+    Framework-free implementation modules. No `@tool`, no `ToolContext`. Unit-testable on their own.
+  </Card>
+</CardGroup>
+
+## The two-file pattern
+
+Every tool ships as a pair:
+
+| File | Responsibility |
+|---|---|
+| `tools/<name>.py` | `@tool` wrapper — schema, description, `ToolContext` wiring |
+| `runtime/tools/<name>.py` | Pure logic — filesystem, subprocesses, tree-sitter, LSP |
+
+The `tools/scan.py` wrapper is a clean example of this boundary in practice:
+
+```python title="tools/scan.py"
+from __future__ import annotations
+
+from tools.base import ToolContext, tool
+from runtime.tools.scan import todo_scan as todo_scan_impl
+
+
+@tool(
+    description=(
+        "Find TODO/FIXME/XXX/HACK comments. Returns path:line:text. "
+        "Default 80 hits. Skips caches, .git, node_modules, venvs."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Optional file or directory to scan. Default whole workspace.",
+            },
+            "pattern": {
+                "type": "string",
+                "description": "Optional extra regex. Default is TODO|FIXME|XXX|HACK.",
+            },
+        },
+    },
+)
+def todo_scan(ctx: ToolContext, path: str = "", pattern: str = "") -> str:
+    return todo_scan_impl(ctx.workspace, path=path, pattern=pattern)
+```
+
+All real work happens in `runtime/tools/scan.py`; the wrapper owns only the schema and the `ctx.workspace` extraction.
+
+## The `@tool` decorator
+
+```python
+from tools.base import tool
+
+def tool(
+    description: str | None = None,
+    *,
+    name: str | None = None,
+    parameters: dict | None = None,
+    family: str = "",
+) -> Callable
+```
+
+<ParamField path="name" type="str" optional>
+  Defaults to the function name. This is the string the LLM uses in tool calls — name it the way you want it to appear on the wire.
+</ParamField>
+
+<ParamField path="description" type="str" optional>
+  Defaults to the function's docstring, then the function name. Keep it short, imperative, and surface any load-bearing constraint (e.g. `"Read the file first"`, `"no TTY"`, `"1-based line numbers"`). The LLM only ever sees the schema, not your source.
+</ParamField>
+
+<ParamField path="parameters" type="dict" optional>
+  A JSON-schema `object` dict. If omitted, the engine auto-derives one from the function signature via type hints (`str`/`int`/`float`/`bool` → their JSON types; `X | None` unwraps to `X`; anything else → `"string"`). Auto-derivation is fine for internal helpers, but every tool shipped in this repo passes an **explicit** `parameters` dict with a `description` on every property — do the same for anything the LLM calls directly.
+</ParamField>
+
+<ParamField path="family" type="str" optional>
+  Groups related tools (e.g. `"mcp"`). The profile registry uses this to expand the `"mcp"` token in `tool_names` without listing every MCP tool by name.
+</ParamField>
+
+<Note>
+  The `@tool` decorator attaches a `_engine_tool` attribute to the decorated function. `discover_tools()` walks every module under `tools/` and collects functions carrying this attribute — no central list to update.
+</Note>
+
+## Function signature rules
+
+- **`ctx` parameter**: if your function declares a `ctx` or `context` parameter, `Tool.execute` calls `fn(ctx, **kwargs)`. Otherwise it calls `fn(**kwargs)`. Always add `ctx: ToolContext` when you need the workspace path, file tracker, LSP, or callbacks.
+- **Sync or async**: both work. `Tool.execute` awaits the result if it's awaitable.
+- **Extra arguments are silently dropped**: the engine filters `kwargs` to your actual parameter names before calling. The model hallucinating an extra field does not raise `TypeError`.
+- **Return type**: the return value is coerced to `str`; `None` becomes `""`.
+
+## `ToolContext` fields
+
+`ToolContext` is injected as the first argument when your function declares `ctx`. Use only the fields you actually need.
+
+```python title="tools/base.py"
+@dataclass
+class ToolContext:
+    workspace: Path           # absolute path to the project root
+    language: Any = None      # detected LanguageInfo
+    lsp: Any = None           # LSPManager, or None if unavailable
+    files: Any = None         # FileTracker: path -> sha256 of last read/write
+    journal: Any = None       # path to the sqlite edit journal
+    session_id: str | None = None
+    on_edit: Any = None       # callback(rel, diff, tool_name, edit_id)
+    config: Any = None        # EngineConfig
+    ask_user: Any = None      # async prompt-the-human hook (approvals)
+    on_output: Any = None     # streaming output callback (shell)
+    on_proc: Any = None       # subprocess-registered callback (shell, for abort)
+    agent_id: str = ""
+    role: str = ""
+    profile: str = ""
+    write_globs: list[str] | None = None
+    write_lock: Any = None
+    skills: Any = None
+    activate_skill: Any = None
+    unlocked_skills: Any = None
+    on_memory: Any = None
+```
+
+<Tip>
+  Only add `ctx: ToolContext` to your signature if you actually use a field from it. A tool that only takes plain string arguments (and calls into `runtime/tools/` with them) doesn't need `ctx` at all.
+</Tip>
+
+## Error handling
+
+Return error strings — don't raise for domain failures.
+
+```python
+# ✅ Correct
+def my_tool(ctx: ToolContext, path: str) -> str:
+    if not path.strip():
+        return "error: path must not be empty"
+    ...
+
+# ❌ Avoid
+def my_tool(ctx: ToolContext, path: str) -> str:
+    if not path.strip():
+        raise ValueError("path must not be empty")  # leaks traceback to the model
+    ...
+```
+
+`ToolRegistry.execute` wraps every call in a `try/except Exception` and turns any unhandled exception into `f"error: {exc}"`, so bare exceptions *work*, but the convention is to **return or raise with a message that already starts with `"error: "`** — either as a plain string or via a named domain exception like `EditError` or `WorkspacePathError`. This keeps messages predictable and testable.
+
+The registry also caps every tool result at `MAX_RESULT = 80_000` characters (truncated with `"\n...[truncated]"`). If your tool can produce large output, truncate earlier and more usefully — see `tools/search.py`'s `max_matches`, or `tools/read_file.py`'s line-window approach.
+
+## Filesystem rules
+
+Never hand-roll path handling. Use the established primitives:
+
+<Accordion title="Reading files — read_source()">
+  ```python
+  from runtime.tools.fileid import read_source
+
+  src = read_source(ctx.workspace, path)
+  # src.text    — decoded string
+  # src.rel     — workspace-relative posix path
+  # src.raw_sha256 — sha256 of raw bytes (for FileTracker)
+
+  # Mark the file as read so the write funnel's read-before-write check passes:
+  if ctx.files is not None:
+      ctx.files.mark(src.rel, src.raw_sha256)
+  ```
+</Accordion>
+
+<Accordion title="Writing / editing files — apply_edit()">
+  Route all writes through `apply_edit` or `apply_workspace_edit`. Never use raw `open()` or `Path.write_text()` on a user-supplied path.
+
+  ```python
+  from runtime.tools.edits import apply_edit, apply_workspace_edit
+
+  async def my_edit_tool(ctx: ToolContext, path: str, new_text: str) -> str:
+      def mutate(src) -> str:
+          return new_text  # return the full new file content
+
+      return await apply_edit(ctx, path, mutate, "my_edit_tool")
+  ```
+
+  `apply_edit` gives you for free:
+  - Path containment (`guard_write_path`): no escaping the workspace, no symlink escapes, no writing into `.git`/`.engine`/lockfiles.
+  - Read-before-write check: refuses if `ctx.files` doesn't hold a matching sha256 for the current on-disk content.
+  - `syntax_gate`: rejects edits that introduce new tree-sitter parse errors in `.py`/`.go`/`.js`/`.ts`.
+  - Preserved newline style, encoding, and indent detection.
+  - Atomic write + sqlite edit journal entry (so `undo_edit` and `list_edits` work automatically).
+  - LSP diagnostics snapshot before/after.
+  - `on_edit` callback fire so the UI/journal sees the change.
+
+  For multi-file edits (e.g. a rename), use `apply_workspace_edit(ctx, edits_by_path, tool_name)`, which prepares every file first and rolls back if any file fails.
+</Accordion>
+
+<Accordion title="Listing / resolving paths — fs helpers">
+  ```python
+  from runtime.tools.fs import resolve_in_workspace, list_tree, SKIP_NAMES
+
+  # Safely resolve a user-supplied relative path:
+  abs_path = resolve_in_workspace(ctx.workspace, user_path)
+
+  # Walk the workspace tree (respects SKIP_NAMES — no node_modules, .git, etc.):
+  nodes = list_tree(ctx.workspace)
+  ```
+</Accordion>
+
+## Subprocess rules
+
+Use `runtime/tools/shell.py` helpers rather than `subprocess` directly:
+
+- Run the process in its own group so a timeout kills the whole tree.
+- Respect `ctx.ask_user` for anything that isn't read-only — don't add new ways to execute arbitrary commands without an approval path.
+- Stream output via `ctx.on_output` in chunks; do not buffer unbounded output in memory.
+- `sudo` and anything touching `.engine` are hard-denied regardless of approval mode.
+
+## Tree-sitter vs LSP
+
+Choose the right tool for the question:
+
+<Tabs>
+  <Tab title="Tree-sitter (fast, no server)">
+    Use `runtime/tools/sitter.py` for structural questions — what symbols are defined in this file, find a node at a location, query a pattern. Instant, no language server required.
+
+    ```python
+    from runtime.tools.sitter import list_symbols, find_symbol
+
+    symbols = list_symbols(ctx.workspace, path)
+    node = find_symbol(ctx.workspace, path, "MyClass")
+    ```
+  </Tab>
+  <Tab title="LSP (types, cross-file)">
+    Use `ctx.lsp` (an `LSPManager`) for type information, go-to-definition, find-references, or hover. **Always check `ctx.lsp is not None` first** — LSP is optional and may not be running.
+
+    ```python
+    _LSP_MISSING = "error: LSP is not available in this session"
+
+    async def my_lsp_tool(ctx: ToolContext, path: str, line: int, col: int) -> str:
+        if ctx.lsp is None:
+            return _LSP_MISSING
+        result = await asyncio.to_thread(ctx.lsp.hover, path, line, col)
+        return result or "no hover info"
+    ```
+  </Tab>
+</Tabs>
+
+## Complete example
+
+Here is a complete, self-contained tool that counts lines in a workspace file — a realistic, minimal example showing both the logic module and its wrapper.
+
+```python title="runtime/tools/linecount.py"
+from __future__ import annotations
+
+from runtime.tools.fileid import read_source
+from pathlib import Path
+
+
+def count_lines(workspace: Path, path: str) -> int:
+    """Return the number of lines in a workspace file."""
+    src = read_source(workspace, path)
+    return len(src.text.splitlines())
+```
+
+```python title="tools/line_count.py"
+from __future__ import annotations
+
+from tools.base import ToolContext, tool
+from runtime.tools.fileid import read_source
+from runtime.tools.linecount import count_lines
+
+
+@tool(
+    description="Count the number of lines in a workspace text file. Read-only.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path to the file.",
+            },
+        },
+        "required": ["path"],
+    },
+)
+def line_count(ctx: ToolContext, path: str) -> str:
+    src = read_source(ctx.workspace, path)
+    if ctx.files is not None:
+        ctx.files.mark(src.rel, src.raw_sha256)
+    n = count_lines(ctx.workspace, path)
+    return str(n)
+```
+
+To verify discovery works:
+
+```python title="tests/test_line_count.py"
+from tools.registry import discover_tools
+
+def test_line_count_discovered():
+    registry = discover_tools()
+    assert "line_count" in registry._tools
+    assert not registry.errors
+```
+
+## Discovery and registration
+
+`discover_tools()` in `tools/registry.py` walks the entire `tools/` package tree, imports every module (skipping `base.py` and `registry.py`), and collects functions with a `_engine_tool` attribute. Two tools with the same `name` is a registration error recorded in `registry.errors` — not a silent overwrite and not a crash.
+
+```python
+from tools.registry import discover_tools
+
+registry = discover_tools()
+assert "line_count" in registry._tools
+assert not registry.errors
+```
+
+The `ctx` fixture in `tests/conftest.py` provides a ready-made `ToolContext` backed by a `tmp_path`, a real sqlite journal, and a `FileTracker`. Use `seed()` from that fixture to write a file with a specific newline style before testing an edit tool against it.
+
+## Tool author checklist
+
+<Steps>
+  <Step title="Logic in runtime/tools/">
+    Real implementation lives in `runtime/tools/<name>.py` (or an existing module). It takes a `Path` and plain args — no `ToolContext`, no `@tool`. Unit-testable on its own.
+  </Step>
+  <Step title="Thin wrapper in tools/">
+    `tools/<name>.py` holds the `@tool` decorator, an explicit `parameters` schema with a `description` on every field, and a one-line call into the runtime helper.
+  </Step>
+  <Step title="Explicit parameters schema">
+    Pass a full JSON schema `dict` with `description` on every property. The LLM sees nothing else — per-field descriptions are its only documentation.
+  </Step>
+  <Step title="Safe path handling">
+    Reads go through `read_source()`. Writes go through `apply_edit()` or `apply_workspace_edit()`. Listings go through `resolve_in_workspace()` / `list_tree()`. Never raw `open()` on a user-supplied path.
+  </Step>
+  <Step title="Return errors, don't raise">
+    Domain failures return `"error: ..."` strings. Reserve exceptions for genuinely unexpected conditions.
+  </Step>
+  <Step title="Cap large output">
+    Truncate/paginate your own output before the registry's blanket 80,000-char cutoff chops it mid-content.
+  </Step>
+  <Step title="Add a test">
+    Cover the happy path and at least one failure path using `discover_tools()` and the `ctx` fixture from `tests/conftest.py`.
+  </Step>
+</Steps>

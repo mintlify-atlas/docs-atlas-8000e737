@@ -1,0 +1,124 @@
+---
+title: "Ask Agent: Read-Only Codebase Survey and Q&A"
+sidebarTitle: "Ask"
+description: "The ask profile surveys your codebase with search, tree-sitter, and LSP — never editing files or running commands — and delivers a briefing the orchestrator hands directly to coder."
+---
+
+Before spawning a coder, the orchestrator needs to know which files matter, what each function does, and what signatures a writer would need to match. The **ask** personality is the purpose-built answer to that need: a strictly read-only agent that works through `search`, tree-sitter, and LSP tools to produce a concrete briefing. It never edits files, never runs shell commands, and never touches the web or GitHub — every answer comes from the source code itself.
+
+## Purpose
+
+The ask agent is a codebase Q&A agent. Given a question or area of the repo to survey, it reads the real source and returns a briefing dense enough that a coder can work from it without re-exploring. It is the orchestrator's designated reader for all *"how does X work"* and *"find where Y is defined"* questions before any write work begins.
+
+<Note>
+  The orchestrator enforces a **survey-once** guard: only one `ask` spawn is allowed per user message turn. If a second spawn is attempted on the same turn, the orchestrator is instructed to answer from what it already has or ask the user for clarification rather than spawning again.
+</Note>
+
+## Tool allowlist
+
+The ask profile is granted exactly the following tool groups:
+
+```python title="agents/profiles/ask.py"
+tool_names = NAV + SITTER + LSP + SCAN + SKILLS + MEMORY
+```
+
+Expanded, that means:
+
+<AccordionGroup>
+  <Accordion title="NAV — filesystem navigation">
+    `list_files`, `read_file`, `search`
+  </Accordion>
+  <Accordion title="SITTER — tree-sitter AST queries">
+    `list_symbols`, `find_symbol`, `get_node_at`, `query_tree`, `parse_file`
+  </Accordion>
+  <Accordion title="LSP — language server protocol">
+    `goto_definition`, `find_references`, `hover`, `get_diagnostics`, `document_symbols`
+  </Accordion>
+  <Accordion title="SCAN — TODO markers">
+    `todo_scan`
+  </Accordion>
+  <Accordion title="SKILLS + MEMORY — knowledge base">
+    `activate_skill`, `read_skill`, `remember`
+  </Accordion>
+</AccordionGroup>
+
+## What ask does NOT have
+
+| Missing capability | Why it matters |
+|---|---|
+| No `SHELL` (`run_command`) | Cannot execute arbitrary commands |
+| No `EDIT` tools | Cannot create, modify, or delete any file |
+| No `WEB` (`web_search`, `web_fetch`) | Limited to the local workspace |
+| No `GH_READ` / `GH_WRITE` | Cannot read or comment on GitHub |
+| No `BROWSER` | No headless browser access |
+| No `HTTP` | Cannot make outbound HTTP requests |
+
+This makes ask safe to run against any workspace without concern for side effects.
+
+## Profile configuration
+
+```python title="agents/profiles/ask.py"
+PROFILE = AgentProfile(
+    name="ask",
+    description=(
+        "Read-only codebase survey and Q&A (search, tree-sitter, LSP). "
+        "Use for any 'how does this work' or 'find X' before spawning coder. "
+        "Cannot edit files or run commands."
+    ),
+    system_prompt=ASK_SYSTEM,
+    tool_names=NAV + SITTER + LSP + SCAN + SKILLS + MEMORY,
+    write_globs=[],        # strictly read-only; all writes rejected
+    required_tools=[],     # no required tool calls
+    max_turns=32,
+)
+```
+
+`write_globs=[]` is the empty list — not `None`. That distinction is meaningful: `None` means unrestricted writes, while `[]` means all write attempts are blocked outright.
+
+## How ask investigates
+
+The ask system prompt prescribes a layered search strategy:
+
+<Steps>
+  <Step title="Tight search first">
+    Use `search` with a specific pattern rather than `list_files` to dump the whole tree. Cache/build directories (`.ruff_cache`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, `coverage`) are discarded immediately.
+  </Step>
+  <Step title="Symbol resolution">
+    Run `list_symbols` or `find_symbol` on the identified source file. If LSP is available, use `goto_definition`, `find_references`, `hover`, and `document_symbols` for precise cross-file navigation.
+  </Step>
+  <Step title="Targeted reads">
+    Use `read_file` on the relevant line windows — not entire files unless necessary.
+  </Step>
+  <Step title="TODO scan">
+    Run `todo_scan` only after the relevant files are already known, not as a discovery step.
+  </Step>
+  <Step title="Persist findings">
+    Call `remember(section="files", path=..., purpose=..., entry_points=..., constraints=...)` with a factual note — not a transcript. The engine also auto-persists the final briefing on finish.
+  </Step>
+</Steps>
+
+## When the orchestrator spawns ask
+
+The orchestrator spawns ask when:
+
+- The user asks a *"how does X work"* or *"where is Y defined"* question that workspace memory does not already answer with fresh notes.
+- A coder task is being prepared but the required paths and signatures are not yet known.
+- Existing memory notes are marked stale or the specific path is missing.
+
+<Tip>
+  If fresh file notes or decision bullets already answer the question, the orchestrator replies from them directly without spawning ask. The orchestrator's system prompt explicitly says: "Quote the note. Do not spawn."
+</Tip>
+
+## What ask reports back
+
+Ask ends with a `REPORT_TO_ORCH`-format briefing — no greetings, no headings, no filler:
+
+```
+what: surveyed the authentication middleware and session store
+paths: src/auth/middleware.py, src/auth/session.py, src/db/models/user.py
+facts: SessionStore.__init__ takes (db: Database, ttl: int = 3600); validate_token() at line 42 calls db.get("session:{token}"); UserModel.id is a UUID primary key
+verdict: complete
+leftover: did not check how tokens are invalidated on logout
+```
+
+The `facts` line must be specific enough (paths, line numbers, signatures, quoted API shapes) that a coder can proceed without re-surveying. A filename alone is never a sufficient answer.

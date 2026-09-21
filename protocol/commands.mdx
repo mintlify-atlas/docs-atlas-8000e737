@@ -1,0 +1,371 @@
+---
+title: "Protocol Commands: Client-to-Engine Messages"
+sidebarTitle: "Commands"
+description: "Complete reference for all 22 typed commands a client sends over the Unix socket to control sessions, submit messages, manage files, drive agents, and configure integrations."
+---
+
+Commands are the client's half of the CodeLoom wire protocol. Each command is a JSON object with a `type` field matching the Python dataclass name. Send one JSON object per line, terminated by `\n`, on the write side of the Unix socket. The engine processes commands sequentially within a session; unknown types, malformed JSON, or missing required fields all produce an `ErrorOccurred` event without dropping the connection.
+
+<Info>
+  Every command is a `@dataclass` registered via the `@command` decorator in `protocol/commands.py`. Fields typed as `X | None` are optional on the wire and default to `None` when absent.
+</Info>
+
+---
+
+## Session lifecycle
+
+### `StartSession`
+
+Starts a new session or resumes a persisted one against the given workspace. This must be the first command sent on any new connection. The engine responds with `SnapshotReady`.
+
+```json
+{"type": "StartSession", "workspace": "/home/user/myproject"}
+{"type": "StartSession", "workspace": "/home/user/myproject", "session_id": "abc123"}
+```
+
+<ParamField body="workspace" type="string" required>
+  Absolute path to the project root. Must match the workspace the engine was
+  booted with — the engine serves exactly one workspace per process and rejects
+  any mismatch.
+</ParamField>
+<ParamField body="session_id" type="string">
+  If provided, the engine restores the persisted session with this ID from
+  `{workspace}/.engine/session.db`. If omitted, a fresh session is created with
+  a new UUID. Stored sessions are listed with `ListSessions`.
+</ParamField>
+
+---
+
+### `ListSessions`
+
+Returns all persisted sessions for the workspace, most recently saved first. The engine responds with a `SessionList` event.
+
+```json
+{"type": "ListSessions"}
+```
+
+No fields.
+
+---
+
+### `Shutdown`
+
+Ends the active session cleanly: persists state to SQLite, shuts down any running language servers, closes all worktrees, and stops the engine. The engine emits `SessionEnded` before the process exits.
+
+```json
+{"type": "Shutdown"}
+```
+
+No fields.
+
+---
+
+## Messaging
+
+### `SubmitUserMessage`
+
+Submits a user message to the orchestrator and triggers an agent turn. If the orchestrator is already mid-reply, the message is queued and played back once the current reply finishes. Any subagent children already running are not interrupted.
+
+```json
+{"type": "SubmitUserMessage", "text": "Refactor the authentication module to use JWT."}
+```
+
+<ParamField body="text" type="string" required>
+  The message text to send. This becomes a `user` role chat entry and starts
+  the orchestrator's reasoning cycle.
+</ParamField>
+
+---
+
+## State queries
+
+### `RequestSnapshot`
+
+Re-emits the full session state. Useful after reconnecting to catch up on any missed events, or to refresh the UI. The engine responds with `SnapshotReady`, optionally followed by `FileContent` events and a `ChatHistoryAdded` / `ChatHistoryComplete` replay.
+
+```json
+{"type": "RequestSnapshot", "replay": true}
+```
+
+<ParamField body="replay" type="boolean">
+  Controls how much is replayed after `SnapshotReady`. Default `true` streams
+  `FileContent` for each open file and replays chat history as `ChatHistoryAdded`
+  events. Set `false` to receive only the base `SnapshotReady` (counts, git,
+  agents, stats) without file contents or history — useful for a quick status
+  summary.
+</ParamField>
+
+---
+
+### `RequestOrchContext`
+
+Returns the orchestrator's current model context — the assembled system prompt, notes, and message history that would be sent to the LLM on the next turn. The engine responds with an `OrchContext` event whose `text` field contains the full context string.
+
+```json
+{"type": "RequestOrchContext"}
+```
+
+No fields.
+
+---
+
+### `RequestContext`
+
+Returns the context breakdown for a specific agent. The engine responds with a `ContextBreakdown` event listing each named section, its character count, estimated token count, and text.
+
+```json
+{"type": "RequestContext", "agent_id": ""}
+{"type": "RequestContext", "agent_id": "agent-uuid-1234"}
+```
+
+<ParamField body="agent_id" type="string">
+  ID of the agent whose context to inspect. An empty string (the default)
+  returns the orchestrator's context. Pass an active subagent ID to inspect
+  that agent's context window.
+</ParamField>
+
+---
+
+### `RequestMemory`
+
+Returns the current workspace memory state — all file notes and categorised decisions stored by agents during the session. The engine responds with a `MemoryUpdated` event.
+
+```json
+{"type": "RequestMemory"}
+```
+
+No fields.
+
+---
+
+### `RequestAgentTranscript`
+
+Returns the complete message transcript for a specific subagent. The engine responds with a sequence of `ChatHistoryAdded` events followed by `ChatHistoryComplete`.
+
+```json
+{"type": "RequestAgentTranscript", "agent_id": "agent-uuid-1234"}
+```
+
+<ParamField body="agent_id" type="string" required>
+  ID of the subagent whose transcript to retrieve. Agent IDs are found in
+  `AgentStarted`, `AgentsUpdated`, and the `agents` list in `EngineSnapshot`.
+</ParamField>
+
+---
+
+## File operations
+
+### `OpenFile`
+
+Adds a file to the session's open-file set and returns its contents. The engine responds with a `FileContent` event carrying the full file text, then keeps the file in the open set so future agent edits produce `FileEdited` events for it.
+
+```json
+{"type": "OpenFile", "path": "src/auth/tokens.py"}
+```
+
+<ParamField body="path" type="string" required>
+  Workspace-relative path to the file to open. The path must resolve inside the
+  workspace root.
+</ParamField>
+
+---
+
+### `CloseFile`
+
+Removes a file from the open-file set. The engine emits a `FileClosed` event. Agent edits to the file may still occur; they simply will not generate incremental `FileEdited` events to this client.
+
+```json
+{"type": "CloseFile", "path": "src/auth/tokens.py"}
+```
+
+<ParamField body="path" type="string" required>
+  Workspace-relative path of the open file to remove from the set.
+</ParamField>
+
+---
+
+### `CreatePath`
+
+Creates a new file or directory inside the workspace. The engine applies the same write-guard rules as agent edits (no symlinks, no `.git` / `.engine` escapes, no lockfiles or secrets).
+
+```json
+{"type": "CreatePath", "path": "src/utils/helpers.py", "is_dir": false, "content": "# helpers\n"}
+```
+
+<ParamField body="path" type="string" required>
+  Workspace-relative path of the file or directory to create.
+</ParamField>
+<ParamField body="is_dir" type="boolean">
+  When `true`, creates a directory (and all missing parents). When `false`
+  (default), creates a regular file.
+</ParamField>
+<ParamField body="content" type="string">
+  Initial text content for a new file. Ignored when `is_dir` is `true`. Defaults
+  to an empty string.
+</ParamField>
+
+---
+
+### `RenamePath`
+
+Renames or moves a file or directory within the workspace.
+
+```json
+{"type": "RenamePath", "src": "src/old_name.py", "dest": "src/new_name.py"}
+```
+
+<ParamField body="src" type="string" required>
+  Workspace-relative source path.
+</ParamField>
+<ParamField body="dest" type="string" required>
+  Workspace-relative destination path.
+</ParamField>
+
+---
+
+### `DeletePath`
+
+Deletes a file or directory from the workspace.
+
+```json
+{"type": "DeletePath", "path": "src/legacy/old_module.py"}
+```
+
+<ParamField body="path" type="string" required>
+  Workspace-relative path of the file or directory to delete.
+</ParamField>
+
+---
+
+## Agent control
+
+### `AbortAgent`
+
+Cancels an in-flight agent. Behaviour depends on whether `agent_id` is supplied.
+
+```json
+{"type": "AbortAgent"}
+{"type": "AbortAgent", "agent_id": "agent-uuid-1234"}
+```
+
+<ParamField body="agent_id" type="string">
+  When omitted (or `null`), cancels only the orchestrator's current reply —
+  any subagent children already running continue. When set to a specific subagent
+  ID, cancels that child agent without affecting the orchestrator or other
+  children.
+</ParamField>
+
+---
+
+### `AnswerPrompt`
+
+Resolves a pending `UserPromptRequested` event. The engine blocks the requesting agent until an answer arrives. Used for command approval, worktree settle choices, and any other interactive confirmation.
+
+```json
+{"type": "AnswerPrompt", "prompt_id": "prompt-uuid-5678", "text": "yes"}
+```
+
+<ParamField body="prompt_id" type="string" required>
+  The `prompt_id` from the corresponding `UserPromptRequested` event.
+</ParamField>
+<ParamField body="text" type="string" required>
+  The user's answer. For choice prompts, this should match one of the strings in
+  the `choices` list, though natural-language equivalents (e.g. `"please merge
+  it"`) are understood by the engine's answer parser.
+</ParamField>
+
+---
+
+## Git
+
+### `RequestGit`
+
+Requests a refresh of the current git state. The engine reads the workspace's git index and emits a `GitStateUpdated` event with branch, dirty flag, staged/unstaged/untracked file lists, and full diffs.
+
+```json
+{"type": "RequestGit"}
+```
+
+No fields.
+
+---
+
+### `UndoLastEdit`
+
+Reverts the most recent agent edit batch. The undo is exact (stored as full before/after byte snapshots in the edit journal) and all-or-nothing across multi-file batches. The engine verifies that each file's current SHA matches the recorded post-edit SHA before reverting; if anything changed since the edit, the undo is refused to prevent discarding subsequent work.
+
+```json
+{"type": "UndoLastEdit"}
+```
+
+No fields.
+
+---
+
+## Integrations
+
+### `ReloadIntegrations`
+
+Triggers a full reload of MCP server configurations and the skill catalog. The engine re-reads `.engine/mcp.json` and the skills directories, then emits `McpServersUpdated` and `SkillCatalogUpdated` events.
+
+```json
+{"type": "ReloadIntegrations"}
+```
+
+No fields.
+
+---
+
+### `SetMcpEnabled`
+
+Enables or disables a named MCP server. Disabling a server removes its tools from the active tool registry for new agent turns without restarting the server process.
+
+```json
+{"type": "SetMcpEnabled", "name": "my-mcp-server", "enabled": false}
+```
+
+<ParamField body="name" type="string" required>
+  The name of the MCP server as declared in `.engine/mcp.json`.
+</ParamField>
+<ParamField body="enabled" type="boolean" required>
+  `true` to enable the server; `false` to disable it.
+</ParamField>
+
+---
+
+### `ActivateSkill`
+
+Loads a skill into the current session context. The engine reads the named skill's `SKILL.md` from `.engine/skills/` or `.cursor/skills/` and emits a `SkillActivated` event. Skills provide additional instructions and context to agent prompts.
+
+```json
+{"type": "ActivateSkill", "name": "my-skill"}
+```
+
+<ParamField body="name" type="string" required>
+  The skill directory name under `.engine/skills/` or `.cursor/skills/`.
+</ParamField>
+
+---
+
+### `CompleteMcpAuth`
+
+Supplies the OAuth/token result for an MCP server that requested authentication. The engine is waiting after emitting `McpAuthRequired`; this command unblocks it.
+
+```json
+{"type": "CompleteMcpAuth", "server": "my-mcp-server", "token": "eyJ..."}
+```
+
+<ParamField body="server" type="string" required>
+  The MCP server name that issued the `McpAuthRequired` event.
+</ParamField>
+<ParamField body="token" type="string" required>
+  The bearer token or credential string to pass to the server. This field is
+  automatically redacted in all server logs — only `<redacted>` appears in any
+  diagnostic output.
+</ParamField>
+
+<Warning>
+  The `token` field is the only field in the entire protocol that is
+  automatically redacted. Never log raw `CompleteMcpAuth` objects from the
+  client side.
+</Warning>

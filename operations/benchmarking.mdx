@@ -1,0 +1,188 @@
+---
+title: "A/B Benchmarking Harness for Engine Evaluation"
+sidebarTitle: "Benchmarking"
+description: "Run bench_ab.py to compare two engine branches on the same prompt, read the side-by-side result table, and generate an HTML flow report with bench_flow.py."
+---
+
+The `scripts/bench_ab.py` harness gives you a repeatable way to compare two versions of CodeLoom Engine on the same target repository and prompt. It clones both engine branches into isolated virtualenvs, clones the target repository twice so both sides start from the same commit SHA, submits the prompt in parallel, and prints a side-by-side result table covering cost, tokens, turns, tool calls, elapsed time, agents, files changed, and PR URL.
+
+## Prerequisites
+
+- `OPENROUTER_API_KEY` in your environment or `env.sh`
+- `TYPESAFE_API_KEY` (or `TYPESAFE_JEV_API_KEY`) for the treatment side's judge
+- An empty `--workdir` (created automatically if missing; must stay empty)
+- `gh` CLI authentication if you want the harness to open pull requests (`--settle pr`, the default)
+
+<Note>
+  `ENGINE_PUSHGATEWAY_URL` is optional. If unset, the harness prints a warning and continues without sending metrics to Grafana. The result table is always written to `summary.txt` regardless.
+</Note>
+
+## Running a benchmark
+
+```bash title="Basic A/B run"
+python scripts/bench_ab.py \
+  --repo https://github.com/org/target \
+  --prompt "Add a failing test for the checkout flow and make it pass" \
+  --workdir /tmp/bench-20240615 \
+  --baseline-ref main \
+  --treatment-ref my-feature-branch \
+  --job-prefix checkout-feature
+```
+
+<Steps>
+  <Step title="Clone both engine versions">
+    The harness clones the engine repo at `--baseline-ref` into `engine-main/` and at `--treatment-ref` into `engine-judge/`, then creates a dedicated virtualenv for each and installs `requirements.txt`.
+  </Step>
+  <Step title="Clone the target repo">
+    The target (`--repo`) is cloned once to `repo-src/` and then cloned twice more to `ws-baseline/` and `ws-judge/`, ensuring both sides start from the identical commit SHA. The remote origin is re-pointed to the original URL so `gh pr create` works.
+  </Step>
+  <Step title="Start both engines in parallel">
+    Each engine is started with `python app.py <workspace>`. The harness waits up to 60 seconds for each `.engine/engine.sock` to appear before submitting the prompt.
+  </Step>
+  <Step title="Submit the prompt and wait">
+    The prompt is submitted via `dummy_client.py --message --auto` on both sides simultaneously in a `ThreadPoolExecutor`. The client waits until each orchestrator is idle with no live subagents. Pass `--timeout N` for a wall-clock fuse.
+  </Step>
+  <Step title="Collect results and print the table">
+    Both engines are stopped gracefully. Stats are loaded from each side's `.engine/session.db` SQLite store, chat transcripts are saved to `logs/`, and the result table is printed and written to `summary.txt`.
+  </Step>
+</Steps>
+
+## CLI flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--repo` | *(required)* | Target git URL or local path |
+| `--prompt` | *(required)* | User message submitted to both engines |
+| `--workdir` | `.` (cwd) | Empty directory to fill with run artifacts |
+| `--engine-url` | This checkout | Engine git URL or path; unpushed local commits are included by default |
+| `--baseline-ref` | `main` | Engine git ref for the baseline (no judge) side |
+| `--treatment-ref` | Current branch | Engine git ref for the treatment (with judge) side |
+| `--timeout` | `0` | Per-side wall-clock timeout in seconds; `0` waits until idle |
+| `--job-prefix` | *(none)* | Prefix for the Grafana job label; `tui-settings` → `job=tui-settings-engine` |
+| `--settle` | `pr` | Auto-answer for worktree settle: `keep`, `pr`, `merge`, or `discard` |
+
+## What is measured — `SideResult` fields
+
+After both sides finish, the harness reads each workspace's SQLite snapshot and builds a `SideResult` dataclass. The printed table and `summary.txt` contain all of these fields side-by-side.
+
+<ResponseField name="cost" type="float">
+  Total LLM cost in USD for this side, from `stats.cost`.
+</ResponseField>
+
+<ResponseField name="prompt_tokens / completion_tokens / cached_tokens / total_tokens" type="int">
+  Token breakdown from `stats.*_tokens`.
+</ResponseField>
+
+<ResponseField name="requests" type="int">
+  Total LLM API request count.
+</ResponseField>
+
+<ResponseField name="turns" type="int">
+  LLM completions counted as session turns.
+</ResponseField>
+
+<ResponseField name="tool_calls" type="int">
+  Finished tool calls for this side.
+</ResponseField>
+
+<ResponseField name="elapsed_s" type="float">
+  Wall time in seconds spent in orchestrator turns.
+</ResponseField>
+
+<ResponseField name="agents" type="list[str]">
+  Profile names of all spawned subagents (e.g. `["coder", "reviewer"]`).
+</ResponseField>
+
+<ResponseField name="files_changed" type="int">
+  Number of modified files including worktree branches under `.engine/worktrees/`.
+</ResponseField>
+
+<ResponseField name="pr_url" type="str">
+  GitHub pull request URL if the session opened one; empty string otherwise.
+</ResponseField>
+
+## Auto-answer policy
+
+The headless client (`--auto`) answers interactive prompts automatically so the run never blocks waiting for human input.
+
+| Prompt type | Auto-answer | Notes |
+|---|---|---|
+| Worktree settle | `pr` (default) | Opens a GitHub PR; override with `--settle keep\|merge\|discard` |
+| MCP auth required | `no` | MCP authentication is declined; tools requiring auth will fail gracefully |
+| Turn cap (continue / handoff / stop) | `continue` | The engine hands off at the second ceiling because `ENGINE_MAX_CONTINUES=1` |
+| Exec / confirm / trust | `yes` | Shell commands and tool confirmations are approved automatically |
+
+<Warning>
+  Judge `block` verdicts refuse actions regardless of the auto-answer policy. A blocked action will not proceed even with `--auto`.
+</Warning>
+
+## Output artifacts
+
+After the run completes, the `--workdir` directory contains:
+
+```
+<workdir>/
+  summary.txt               side-by-side result table
+  logs/
+    run.log                 harness transcript (stdout + stderr combined)
+    engine-baseline.log     stdout/stderr from the baseline engine process
+    engine-judge.log        stdout/stderr from the treatment engine process
+    client-baseline.log     formatted events from the baseline headless client
+    client-judge.log        formatted events from the treatment headless client
+    transcript-baseline.txt full chat history for the baseline side
+    transcript-judge.txt    full chat history for the treatment side
+  ws-baseline/              complete baseline workspace (git tree, .engine/)
+  ws-judge/                 complete treatment workspace
+  engine-main/              cloned baseline engine (with .venv)
+  engine-judge/             cloned treatment engine (with .venv)
+```
+
+## Generating the HTML flow report
+
+`scripts/bench_flow.py` reads a completed `bench_ab.py` workdir and produces a single self-contained HTML file at `<workdir>/flow-report.html`.
+
+```bash title="Generate flow report"
+python scripts/bench_flow.py --workdir /tmp/bench-20240615
+
+# Override the output path
+python scripts/bench_flow.py --workdir /tmp/bench-20240615 --out /tmp/report.html
+```
+
+The script only reads existing artifacts — `summary.txt`, `logs/run.log`, `logs/client-*.log`, `logs/transcript-*.txt` — and can be re-run at any time after the bench run finishes without re-running the engines.
+
+### What the HTML report contains
+
+<CardGroup cols={2}>
+  <Card title="Side-by-side Mermaid flowchart" icon="diagram-project">
+    A `flowchart LR` diagram with one subgraph per side. Each node represents a spawned agent phase, labeled with profile name, cost, token count, and any judge gate tally. Outcome nodes are color-coded: green for PR opened, amber for flagged/warned, red for blocked or aborted.
+  </Card>
+  <Card title="Metric bar charts" icon="chart-bar">
+    Paired horizontal bars comparing baseline vs. treatment for cost, total tokens, LLM requests, turns, tool calls, and elapsed time. A hero tile at the top shows the cost delta and outcome for each side at a glance.
+  </Card>
+  <Card title="Stacked judge verdict bars" icon="shield-check">
+    One stacked bar per judge gate tag (e.g. `intent_route`, `merge_gate`, `write_gate`). Segments are colored green (allow), amber (flag/prompt), or red (block/deny), with a verdict×count breakdown.
+  </Card>
+  <Card title="Per-phase narrative" icon="file-lines">
+    Collapsed `<details>` cards for each agent phase showing what was found and built, reviewer verdicts, leftover questions, files touched, judge call detail, and tool call tally — pulled from the transcript and client log.
+  </Card>
+</CardGroup>
+
+When `ENGINE_TRACE_CALLS=1` was active during the run (the harness enables it automatically), each phase card also expands to show full tool call detail: the exact arguments, result, and the model's stated reasoning for choosing that tool. Judge call cards show the full LLM request and response from `trace.jsonl`.
+
+<Tip>
+  `bench_ab.py` sets `ENGINE_TRACE_CALLS=1` for both sides automatically since this report format was introduced. If you ran an earlier bench without it, re-run with the current harness to get per-call detail in the report.
+</Tip>
+
+### "Why the outcome differs" section
+
+The report synthesizes a short narrative from the data: which side was cheaper, whether the judge spawned extra agents the baseline did not, how many actions were flagged or hard-blocked, what the reviewer agent returned, and whether both sides opened a PR or one aborted. This section never fabricates — it only draws conclusions supported by the parsed log data.
+
+## Grafana integration
+
+When `ENGINE_PUSHGATEWAY_URL` is set, both sides push metrics to the same Pushgateway under the same job label but different `instance` values (`baseline` and `judge` by default). Use the dashboard's `instance` filter to compare the two series. The shell table in `summary.txt` is always the authoritative source; Grafana adds timeline visibility for long-running sessions.
+
+```
+Filter:  job="my-project-engine"
+Series:  instance=baseline  vs.  instance=judge
+Panels:  cost, tokens, turns, tools, elapsed
+```

@@ -1,0 +1,331 @@
+---
+title: "Troubleshoot Common CodeLoom Engine Issues"
+sidebarTitle: "Troubleshooting"
+description: "Diagnose and fix the most common CodeLoom Engine problems: startup failures, API key rejections, LLM errors, file edit denials, LSP gaps, and MCP connection issues."
+---
+
+Most problems with CodeLoom Engine fall into one of a small number of categories. This page walks through each one with the exact error you will see, why it happens, and how to resolve it. Enable trace logging as a first step when the cause is not obvious — it captures every tool call and its result in `.engine/trace.jsonl` without affecting the run.
+
+## Startup and connection issues
+
+<Accordion title="Socket not found — engine not running or wrong workspace">
+**Error:** `no server socket at .../engine.sock`
+
+The engine exposes a Unix domain socket at `<workspace>/.engine/engine.sock`. This error means either the engine process is not running, or the client is pointing at a different workspace directory than the engine was started with.
+
+**Resolution:**
+1. Start the engine: `python app.py /path/to/workspace`
+2. Make sure both the engine and the client reference the same absolute workspace path
+3. Check that the engine process has not crashed — look at its stdout/stderr for an error before the socket appeared
+
+The socket is created during `EngineServer` startup and removed when the engine shuts down. If a previous session crashed, the stale socket file may still exist; the engine removes and recreates it on the next start.
+</Accordion>
+
+<Accordion title="Missing or placeholder OPENROUTER_API_KEY">
+**Error:** `set OPENROUTER_API_KEY to a real key (env.sh or the environment)`
+
+The engine rejects any API key that matches the `PLACEHOLDERS` sentinel set defined in `llm/openrouter.py`:
+
+```python
+PLACEHOLDERS = {"", "...", "<OPENROUTER_API_KEY>", "your-key", "changeme"}
+```
+
+These values are treated as unset, not as real keys. The engine still starts and will serve file, tree, git, snapshot, and undo commands — only `SubmitUserMessage` fails.
+
+**Resolution:**
+1. Put a real `OPENROUTER_API_KEY` in `env.sh` at the workspace root:
+   ```bash title="env.sh"
+   export OPENROUTER_API_KEY=sk-or-v1-...
+   ```
+2. Or export it in your shell before starting the engine
+3. Note that a live shell export takes precedence over `env.sh` — a stale `export OPENROUTER_API_KEY=your-key` in your shell profile will shadow the file value
+
+<Warning>
+  `env.sh` is in `.gitignore` and the engine's write guard refuses to let agents write to it. Never commit API keys to version control.
+</Warning>
+</Accordion>
+
+<Accordion title="Python version too old">
+**Error:** `SyntaxError` or import failures on startup
+
+CodeLoom Engine requires Python 3.9 or later (tested against 3.11). Earlier versions may fail at parse time on type-annotation syntax or `match` statements used in the runtime.
+
+**Resolution:**
+```bash
+python --version        # must be 3.9 or later
+python3.11 app.py /path/to/workspace   # use a specific binary if needed
+```
+
+The benchmark harness (`bench_ab.py`) creates its own virtualenv using `sys.executable`, so whatever Python you invoke it with propagates to both engine sides.
+</Accordion>
+
+<Accordion title="rg (ripgrep) not found">
+**Error:** `search` tool returns an error; logs show `rg` not on `PATH`
+
+The `search` tool wraps `rg` (ripgrep) for fast workspace-wide text search. If `rg` is not on `PATH`, the tool fails at call time rather than at startup.
+
+**Resolution:**
+```bash
+# macOS
+brew install ripgrep
+
+# Ubuntu / Debian
+sudo apt install ripgrep
+
+# Verify
+rg --version
+```
+
+The `runtime_info` tool (available to the agent) reports the installed `rg` version and confirms it is visible. Tree-sitter and LSP tools continue to work without ripgrep — only the `search` tool is affected.
+</Accordion>
+
+## LLM and API issues
+
+<Accordion title="Model not found or bad model name">
+**Error:** `404` or `model not found` from OpenRouter
+
+The model is specified by `OPENROUTER_MODEL`. Any model identifier supported by OpenRouter with tool-calling enabled is valid; a typo or a model name that does not support function calling will fail at the first `SubmitUserMessage`.
+
+**Resolution:**
+```bash
+# Check the current model
+echo $OPENROUTER_MODEL
+
+# Set in env.sh
+export OPENROUTER_MODEL=openai/gpt-4o
+
+# For subagents, set a separate child model
+export OPENROUTER_CHILD_MODEL=openai/gpt-4o-mini
+```
+
+The default if unset is `openai/gpt-4o-mini`.
+</Accordion>
+
+<Accordion title="Streaming timeout — idle stream">
+**Error:** `LLMError: stream idle timeout` or the turn hangs and then fails
+
+The engine enforces an idle timeout on the streaming response: if no token arrives for `ENGINE_LLM_IDLE_S` seconds (default 90), the request is abandoned. This can happen on very large context windows, slow models, or under OpenRouter load.
+
+**Resolution:**
+```bash
+# Increase the idle timeout
+export ENGINE_LLM_IDLE_S=180
+```
+
+For debugging, disable streaming entirely to get a synchronous response:
+```bash
+export ENGINE_LLM_STREAM=0
+```
+
+Note that disabling streaming removes token-by-token UI updates — `ChatMessageDelta` events will not fire.
+</Accordion>
+
+<Accordion title="Context window exceeded — compaction triggers">
+When the orchestrator's history exceeds `ENGINE_CONTEXT_BUDGET` tokens (default 120,000), the engine compacts it automatically using a summarization strategy. This is normal behavior and is tracked in `engine_compactions` in Prometheus. You will see a `ContextCompacted` event in the client stream.
+
+If compaction fires frequently or the run still fails after compaction, the context budget may be too low for the task, or the compaction summary may be losing critical state.
+
+**Resolution:**
+```bash
+# Raise the budget (tokens, not characters)
+export ENGINE_CONTEXT_BUDGET=200000
+```
+
+<Info>
+  Subagents (coder, tester, reviewer) never compact in-loop — their trigger is set to `2.0` (never fires within the turn). They summarize via `compress_for_parent` when they finish. Only the orchestrator compacts mid-session.
+</Info>
+</Accordion>
+
+<Accordion title="Rate limits and cost overruns">
+OpenRouter rate limit errors appear as `LLMError` in the engine logs and as `ErrorOccurred` events on the client. The engine does not retry automatically.
+
+Watch the `StatsUpdated` events in your client to track cumulative cost and token consumption in real time. The `engine_run_cost_usd` Prometheus gauge shows the same number on the Grafana dashboard.
+
+**Resolution:**
+- Check your OpenRouter account for quota and rate-limit tiers
+- Lower `ENGINE_MAX_SPAWNS_PER_TURN` (default 8) to reduce parallel LLM calls
+- Use `OPENROUTER_CHILD_MODEL` to route subagents to a cheaper model
+- Set `ENGINE_MAX_TURNS` (default 16) to cap the number of tool-calling turns per message
+</Accordion>
+
+## File editing issues
+
+<Accordion title="str_replace fails — not unique or not found">
+**Error:** `str_replace: old_string not found` or `str_replace: old_string is not unique`
+
+The `str_replace` tool requires `old_string` to match exactly once in the file. Zero matches means the string was not found (content differs from what the agent read, the file changed, or the string has different whitespace/encoding). Multiple matches means the string is ambiguous.
+
+**Resolution:**
+- Use more context in `old_string` — include surrounding lines until the excerpt is unique
+- Re-read the file with `read_file` immediately before calling `str_replace` to ensure the content is fresh
+- For structural replacements (whole function, whole class), prefer `replace_symbol` which uses tree-sitter for robust matching that tolerates whitespace differences
+</Accordion>
+
+<Accordion title="Write denied — path in denylist">
+**Error:** `writes to .git/ are not allowed`, `writes to lockfile 'package-lock.json' are not allowed`, or `writes to 'env.sh' are not allowed`
+
+The `guard_write_path` function in `runtime/tools/fileid.py` enforces a hard denylist before any write reaches disk. Denied paths include:
+
+- **Directory prefixes:** `.git/`, `.engine/`, `.cursor/`, `__pycache__/`, `node_modules/`, `.venv/`, and other tooling directories (full list in `runtime/tools/fs.py`)
+- **Lockfiles:** `package-lock.json`, `uv.lock`, `poetry.lock`, `Cargo.lock`, `go.sum`
+- **Env files:** `env.sh`, `.env`, any file matching `.env.*`
+- **Symlinks:** the engine refuses to write through a symlink
+
+**Resolution:**
+These denials are intentional safety guards. If you need to regenerate a lockfile, run the package manager command through `run_command` instead of writing directly. For `.env` files, manage them outside the workspace or pass values through environment variables.
+</Accordion>
+
+<Accordion title="Syntax gate rejection — new ERROR nodes introduced">
+**Error:** `syntax gate: edit introduces new tree-sitter ERROR nodes`
+
+Before committing any edit to disk, the engine parses the new file content with tree-sitter and counts `ERROR` and `MISSING` nodes. If the new text introduces more error nodes than the original, the write is rejected. This prevents the agent from silently landing broken syntax.
+
+**Resolution:**
+- Re-read the file and check what the agent is trying to change
+- If the file was already broken before the edit, the gate allows the edit through (you cannot make a broken file worse)
+- For languages without tree-sitter grammar support, the gate is skipped — check `runtime/tools/sitter.py` for supported languages
+
+<Note>
+  The syntax gate intentionally allows edits that fix existing errors even if the result is not fully valid — the criterion is that new errors must not be introduced, not that the file must be error-free.
+</Note>
+</Accordion>
+
+<Accordion title="Stale file — FileTracker SHA mismatch">
+**Error:** `{path} changed on disk since you read it` or `read {path} before editing it`
+
+`FileTracker` maps every workspace-relative path to the SHA-256 of the bytes the agent last read or wrote. Before any edit, the engine re-hashes the file and compares. A mismatch means the file changed on disk between the read and the edit attempt.
+
+**Resolution:**
+- Call `read_file` on the path again immediately before retrying the edit
+- If another agent or an external process modified the file, the agent needs to see the new content before editing
+- The error `read {path} before editing it` (no recorded SHA) means the agent has never read this path in the current session — always read before editing
+</Accordion>
+
+## LSP issues
+
+<Accordion title="LSP server not found or unavailable">
+**Error:** LSP tools return `no language server` or diagnostics are empty
+
+The engine supports Python (`pyright`), TypeScript/JavaScript (`typescript-language-server`), and Go (`gopls`). Each is launched lazily on first use. If the binary is missing, the LSP tools fail silently and the engine emits a `WarningOccurred` event.
+
+| Language | Binary | Install |
+|---|---|---|
+| Python | `npx -y -p pyright pyright-langserver --stdio` | Requires `node`/`npx` |
+| TypeScript / JavaScript | `npx -y typescript-language-server --stdio` | Requires `node`/`npx` |
+| Go | `gopls serve` | `go install golang.org/x/tools/gopls@latest` |
+
+**Resolution:**
+- Install the appropriate runtime (`node` for Python/TS, Go toolchain for Go)
+- The tree-sitter tools (`query_tree`, `find_symbol`, `outline`) work without any LSP and are the intended fallback for unsupported languages
+</Accordion>
+
+<Accordion title="Diagnostics timeout or first call is slow">
+The LSP warm start indexes up to 500 files. The first `npx` invocation for `pyright` or `typescript-language-server` may download a package, and `gopls` can take several seconds to analyze a large Go module.
+
+**Resolution:**
+- Wait for the first call to complete — subsequent calls use the already-running server
+- If diagnostics return empty, call `get_diagnostics` again after a brief delay; the server may still be indexing
+- For large repositories, `get_diagnostics` on a specific file is faster than a workspace-wide request
+</Accordion>
+
+<Accordion title="ctx.lsp is not None guard in custom tools">
+When writing a custom tool that calls LSP methods, always guard against the case where no language server is available for the file's language:
+
+```python title="Custom tool with LSP guard"
+@tool
+async def my_lsp_tool(ctx: ToolContext, path: str) -> str:
+    if ctx.lsp is None:
+        return "error: no language server available for this workspace"
+    diagnostics = await ctx.lsp.get_diagnostics(path)
+    ...
+```
+
+Calling LSP methods without this guard will raise an `AttributeError` if the workspace language is unsupported.
+</Accordion>
+
+## Worktree issues
+
+<Accordion title="Dirty worktree after agent aborted">
+When a `coder` or `tester` subagent is aborted (via `AbortAgent` or session shutdown), its worktree at `workspace/.engine/worktrees/<agent_id>/` may contain uncommitted changes. The engine recovers leftover worktrees on session restart and presents them for settlement.
+
+**Resolution:**
+1. On the next session start, the engine re-discovers the worktree and prompts: `merge`, `open a PR`, `keep`, or `discard`
+2. To clean up manually: `git -C workspace/.engine/worktrees/<agent_id>/ checkout HEAD -- .`
+3. To discard entirely: reply `discard` to the settle prompt, which deletes the worktree and branch
+
+After a `keep`, the orchestrator must call `settle_worktree` explicitly; it cannot spawn another coder against the same branch.
+</Accordion>
+
+<Accordion title="Settle conflict on merge">
+When the orchestrator issues `settle_worktree` with `action=merge` and the agent's branch has diverged from the main branch, the merge may produce conflicts.
+
+**Resolution:**
+- The `WorktreeSettled` event's `detail` field contains the conflict report
+- Use `pr` instead of `merge` to let the PR process handle conflict resolution via review
+- Resolve conflicts manually in the worktree directory and re-run settle, or discard and re-run the task
+</Accordion>
+
+## MCP issues
+
+<Accordion title="MCP server not connecting">
+MCP servers are configured in `.engine/mcp.json`. Each entry specifies a `command` and `args` array that the engine runs as a subprocess. If the command is not found or exits immediately, MCP tools for that server will not be registered.
+
+```json title=".engine/mcp.json (example)"
+{
+  "servers": {
+    "my-server": {
+      "command": "node",
+      "args": ["/path/to/mcp-server/index.js"]
+    }
+  }
+}
+```
+
+**Resolution:**
+- Verify the command runs manually: `node /path/to/mcp-server/index.js`
+- Check engine startup logs for `ErrorOccurred` events naming the MCP server
+- Tool names are namespaced as `mcp_{server}_{tool}` — a server that fails to connect means all its tools are absent without crashing the session
+</Accordion>
+
+<Accordion title="MCP server requires authentication">
+Some MCP servers initiate an OAuth or token flow on first use. The engine surfaces this as a `McpAuthRequired` event and a `UserPromptRequested` with `kind=mcp_auth`. The agent pauses until the prompt is answered.
+
+**Resolution:**
+- Complete the auth flow in your client by answering the `UserPromptRequested` prompt with the token or confirming the OAuth redirect
+- In headless / `--auto` mode, the client auto-answers MCP auth as `no`, which declines the auth and makes tools from that server unavailable for the run
+- Pre-authenticate by storing credentials in the server's config before starting the engine
+</Accordion>
+
+## Enabling debug traces
+
+When the root cause is not clear from the event stream alone, enable full-fidelity JSONL tracing:
+
+```bash
+export ENGINE_TRACE_CALLS=1
+python app.py /path/to/workspace
+```
+
+Every tool call's arguments and result are appended to `.engine/trace.jsonl`. Records are capped at 4,000 characters per string field and 16,000 characters per record to keep the file manageable. Failures writing to the trace file are silently ignored — they never affect the run.
+
+```bash title="Tail the trace log in real time"
+tail -f /path/to/workspace/.engine/trace.jsonl | python -m json.tool
+```
+
+### Subscriber overflow warnings
+
+If a client connection falls behind reading events, the `Subscriber` buffer (default 4,096 events, 1 MiB) will fill up. When this happens:
+
+1. Droppable events (`ChatMessageDelta`, `CommandOutputChunk`) are evicted first
+2. If the buffer is still full, a `WarningOccurred` event replaces the oldest event with an overflow notice:
+   ```
+   event stream overflowed; N events dropped, send RequestSnapshot to resync
+   ```
+3. When the client drains below the recovery mark (1,024 events), a follow-up `WarningOccurred` appears:
+   ```
+   dropped N streaming events while the client was behind; full message text was not affected
+   ```
+
+**Resolution:**
+- Send a `RequestSnapshot` command to resync the full session state after an overflow
+- If overflows are frequent, increase `ENGINE_SUBSCRIBER_CAPACITY` (default 4,096) or `ENGINE_SUBSCRIBER_BYTES` (default 1 MiB) in `env.sh`
+- Overflows only affect the streaming event feed — the underlying chat history and session state are never lost

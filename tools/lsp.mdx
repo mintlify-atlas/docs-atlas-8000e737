@@ -1,0 +1,264 @@
+---
+title: "LSP Tools: Type-Aware Code Intelligence"
+sidebarTitle: "LSP"
+description: "Six language-server tools for go-to-definition, cross-file references, hover types, diagnostic squiggles, symbol outlines, and safe multi-file renames."
+---
+
+The LSP tools delegate to running language server processes managed by `LSPManager` in `runtime/tools/lsp.py`. Unlike the tree-sitter tools, LSP tools understand imports, cross-file types, and the project's full dependency graph. The trade-off is a warm-start latency the first time a language's server is invoked: the manager opens up to 500 workspace files (`INDEX_FILE_CAP`) and waits for the initial diagnostic publish before returning.
+
+<Info>
+All LSP tools require `ctx.lsp` to be non-`None`. When no language server is configured for the workspace (e.g. a workspace with only shell scripts), every tool returns `error: LSP is not available for this workspace (need python, go, or javascript/typescript)`.
+</Info>
+
+---
+
+## Supported language servers
+
+| Language | Server binary | File extensions |
+|---|---|---|
+| Python | `pyright-langserver` (via `npx`) | `.py`, `.pyi` |
+| TypeScript | `typescript-language-server` (via `npx`) | `.ts`, `.tsx`, `.mts`, `.cts` |
+| JavaScript | `typescript-language-server` (via `npx`) | `.js`, `.jsx`, `.mjs`, `.cjs` |
+| Go | `gopls` | `.go` |
+
+JavaScript and TypeScript share a server instance. When either language is activated, both sets of extensions are indexed together (`warm_languages` returns both).
+
+---
+
+## Coordinate system
+
+All LSP tools use **1-based** `line` and `character` coordinates, matching the output of `read_file` and the tree-sitter tools. The `runtime/tools/lsp.py` implementation subtracts 1 before sending LSP protocol messages (which use 0-based positions).
+
+Obtain coordinates from:
+- The `lines M-N of T` header in `read_file` output (line numbers at the start of each line)
+- The `file:line:col` annotations in `list_symbols` / `find_symbol` output
+- Any `path:line:col` search result
+
+---
+
+## Warm-start behavior
+
+The first call to any LSP tool for a language triggers server initialization:
+
+1. The `LSPClient` spawns the language server subprocess.
+2. `initialize` + `initialized` handshake completes (30s timeout).
+3. `index_workspace` opens up to 500 source files with `textDocument/didOpen`.
+4. `_wait_for_diagnostics` polls until the server publishes its first diagnostic set (20s max).
+
+Subsequent calls in the same session are instant — the server process stays alive and files are synced on demand via `textDocument/didChange` when `sync_if_stale` detects a disk change.
+
+---
+
+## Symbol kinds
+
+`document_symbols` annotates each symbol with a `SYMBOL_KINDS` integer code:
+
+| Code | Kind | Code | Kind |
+|---|---|---|---|
+| 5 | Class | 12 | Function |
+| 6 | Method | 13 | Variable |
+| 9 | Constructor | 10 | Enum |
+| 11 | Interface | 14 | Constant |
+| 23 | Struct | 26 | TypeParameter |
+
+Full mapping: codes 1–26, see `runtime/tools/lsp.py::SYMBOL_KINDS`.
+
+---
+
+## `goto_definition`
+
+```python
+async goto_definition(ctx: ToolContext, path: str, line: int, character: int) -> str
+```
+
+Jumps to the definition of the symbol at the given position. Unlike `find_symbol`, this follows import chains and resolves symbols defined in other files or installed packages.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path of the file containing the reference.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number containing the symbol.
+</ParamField>
+
+<ParamField path="character" type="int" required>
+  1-based column of, or within, the symbol name.
+</ParamField>
+
+### Return value
+
+```
+runtime/config.py:14:7  class EngineConfig:
+```
+
+Up to 20 results (`LOCATION_MAX`) formatted as `path:line:col  source_snippet`. Returns `No definition found at <path>:<line>:<character>` when the server has no result.
+
+---
+
+## `find_references`
+
+```python
+async find_references(ctx: ToolContext, path: str, line: int, character: int) -> str
+```
+
+Returns all usages of the symbol at the given position across the indexed workspace, including the declaration site. Use this before renaming or deleting a symbol to understand its blast radius.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number.
+</ParamField>
+
+<ParamField path="character" type="int" required>
+  1-based column.
+</ParamField>
+
+### Return value
+
+Up to 50 results (`REFERENCES_MAX`) in `path:line:col  snippet` format. Returns `No references found at <path>:<line>:<character>` for unreferenced symbols.
+
+---
+
+## `hover`
+
+```python
+async hover(ctx: ToolContext, path: str, line: int, character: int) -> str
+```
+
+Returns the type signature and documentation for the symbol at the given position — identical to hovering over a token in VS Code. Use this for inferred types, return types, and docstrings. For structural information (node type, parent), use `get_node_at` instead.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number.
+</ParamField>
+
+<ParamField path="character" type="int" required>
+  1-based column.
+</ParamField>
+
+### Return value
+
+The raw hover content string from the server (Markdown or plain text). Returns `No hover information at <path>:<line>:<character>` when the server has nothing to report.
+
+### Example
+
+```
+(method) AgentLoop.run() -> None
+
+Run the agent loop until the session ends or the turn limit is reached.
+```
+
+---
+
+## `get_diagnostics`
+
+```python
+async get_diagnostics(ctx: ToolContext, path: str) -> str
+```
+
+Returns all errors, warnings, info, and hint diagnostics for `path` as reported by the language server — the same information shown as squiggly underlines in an editor. Opening the file triggers a `textDocument/didOpen` if it hasn't been opened yet, and waits up to 5 seconds for the server to publish diagnostics.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+### Return value
+
+```
+runtime/config.py:42:5 Error: [pyright] Cannot access attribute "timeout" for class "EngineConfig"
+runtime/config.py:78:9 Warning: [pyright] Variable "x" is not used
+```
+
+Returns `No diagnostics for '<path>' (clean).` when the file is error-free.
+
+---
+
+## `document_symbols`
+
+```python
+async document_symbols(ctx: ToolContext, path: str) -> str
+```
+
+Requests the full symbol outline from the language server via `textDocument/documentSymbol`. The server returns a hierarchical list with `SymbolKind` codes covering kinds that tree-sitter may not capture, such as `Enum`, `EnumMember`, `Constant`, and `TypeParameter`.
+
+Prefer `list_symbols` (tree-sitter) first. Use `document_symbols` when the tree-sitter outline looks incomplete — for example, in TypeScript files with complex interface hierarchies.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+### Return value
+
+```
+14 symbol(s) in runtime/config.py
+Class EngineConfig  14:7
+  Method __init__  15:9
+  Method from_env  82:5  staticmethod
+  Variable default_model  28:9
+  Constant MAX_TURNS  10:1
+```
+
+Capped at 200 symbols (`SYMBOL_MAX`). Returns `No document symbols for '<path>'` when the server has no symbols.
+
+---
+
+## `rename_symbol`
+
+```python
+async rename_symbol(ctx: ToolContext, path: str, line: int, character: int, new_name: str) -> str
+```
+
+Renames the symbol at the given position via the language server's `textDocument/rename` request. The server returns a `WorkspaceEdit` covering every reference across all open files; the edit funnel then applies each file change atomically and journals them as a single batch that can be undone with `undo_edit`.
+
+This is the correct way to rename identifiers. Text-based search-and-replace misses references in string literals, docstrings, or shadowed scopes.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path of any file containing the symbol.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number.
+</ParamField>
+
+<ParamField path="character" type="int" required>
+  1-based column of the symbol name.
+</ParamField>
+
+<ParamField path="new_name" type="str" required>
+  New identifier. Must be a valid identifier for the language.
+</ParamField>
+
+### Return value
+
+One `ok: edited <path>` + diff block per modified file, separated by blank lines. Returns an error if the server produces no edits (e.g. the cursor is not on a renameable symbol).
+
+### Example workflow
+
+```python
+# 1. Find the symbol's position
+find_symbol(ctx, "runtime/config.py", "EngineConfig")
+# → Found 'EngineConfig' at runtime/config.py:14:7
+
+# 2. Rename it
+rename_symbol(ctx, "runtime/config.py", 14, 7, "SessionConfig")
+# → ok: edited runtime/config.py
+#   ok: edited runtime/session.py
+#   ok: edited app.py
+```

@@ -1,0 +1,119 @@
+---
+title: "Researcher Agent: External Library and API Investigation"
+sidebarTitle: "Researcher"
+description: "The researcher profile surveys external libraries, GitHub repos, package registries, and API docs — never editing the workspace — and delivers a source-cited briefing the orchestrator passes to coder."
+---
+
+When the orchestrator needs facts about something that is not in the local workspace — a third-party library, an external API, a GitHub repository, a CVE, or documentation — it spawns the **researcher** personality. Researcher has no filesystem write access and never runs shell commands. Its entire job is to gather external facts, cite their sources, and produce a briefing specific enough that a coder can act on it without re-fetching the same pages.
+
+## Purpose
+
+Researcher investigates libraries, APIs, GitHub repos, documentation sites, and anything else outside the workspace. It is the orchestrator's designated tool for *"what does this library do"*, *"is this version vulnerable"*, *"how does this API work"*, and *"what does that GitHub repo export"* questions. Like `ask`, it is a survey-once personality per user message — the orchestrator may spawn it at most once per turn.
+
+## Tool allowlist
+
+```python title="agents/profiles/researcher.py"
+tool_names = WEB + NAV + GH_REPO + PKG + DOCS + SEC + OPENAPI + DEP + SKILLS + MEMORY + MCP
+```
+
+<AccordionGroup>
+  <Accordion title="WEB — web search and fetch">
+    `web_search`, `web_fetch`
+  </Accordion>
+  <Accordion title="NAV — workspace cross-reference (secondary)">
+    `list_files`, `read_file`, `search` — used only after external facts are in hand, to relate findings to the local workspace
+  </Accordion>
+  <Accordion title="GH_REPO — GitHub repository exploration">
+    `github_compare`, `github_search_code`, `github_file`, `github_repo`, `github_tree`
+
+    <Warning>
+      Use `github_repo`, `github_tree`, and `github_file` to read GitHub content. Do **not** use `web_fetch` on `github.com` HTML — the tool will refuse it.
+    </Warning>
+  </Accordion>
+  <Accordion title="PKG — package registry">
+    `pkg_info` — for npm, PyPI, crates.io, and similar registry lookups
+  </Accordion>
+  <Accordion title="DOCS + OPENAPI — documentation and API specs">
+    `docs_lookup`, `tldr`, `openapi_ops` — check docs and OpenAPI specs before falling back to web search
+  </Accordion>
+  <Accordion title="SEC — security advisories">
+    `osv_query` — for CVE and vulnerability lookups via the OSV database
+  </Accordion>
+  <Accordion title="DEP — dependency graph">
+    `dep_why` — to understand why a package is in the dependency tree
+  </Accordion>
+  <Accordion title="SKILLS + MEMORY — knowledge base">
+    `activate_skill`, `read_skill`, `remember`
+  </Accordion>
+  <Accordion title="MCP — Model Context Protocol extensions">
+    `mcp` — for additional server-side tools registered via MCP
+  </Accordion>
+</AccordionGroup>
+
+## Profile configuration
+
+```python title="agents/profiles/researcher.py"
+PROFILE = AgentProfile(
+    name="researcher",
+    description=(
+        "Investigate libraries, APIs, GitHub repos, and docs. "
+        "Survey remote repos with github_repo / github_tree / github_file — "
+        "do not fetch GitHub HTML. Cannot edit the workspace."
+    ),
+    system_prompt=RESEARCHER_SYSTEM,
+    tool_names=WEB + NAV + GH_REPO + PKG + DOCS + SEC + OPENAPI + DEP + SKILLS + MEMORY + MCP,
+    write_globs=[],    # strictly read-only; no workspace edits
+    required_tools=[],
+    max_turns=32,
+)
+```
+
+`write_globs=[]` — researcher cannot modify any file in the workspace. Its findings exist only in the briefing it returns and in any `remember()` calls it makes during the run.
+
+## Survey-once guard
+
+Researcher shares the survey-once constraint with `ask`: only one researcher spawn is allowed per user message turn. A second attempt returns:
+
+```
+error: already spawned researcher this user message; answer with what you have or ask the user
+```
+
+An `incomplete` result arms a single retry (tracked via `_survey_retry`). If the retry is also `incomplete` or hits `max_turns`, the orchestrator reports the `leftover` to the user rather than continuing to spawn.
+
+## How researcher investigates
+
+The system prompt defines a priority order for information sources:
+
+<Steps>
+  <Step title="GitHub repos: start with the repo root">
+    Call `github_repo` to get top-level metadata, then `github_tree` at the root. Read `README*`, `pyproject.toml`, `package.json`, `Cargo.toml`, `go.mod`, and docs directories via `github_file`. Dive into subdirectories that matter, then use `github_search_code` for entry points or specific APIs.
+  </Step>
+  <Step title="Libraries, APIs, advisories: structured tools first">
+    Use `docs_lookup`, `pkg_info`, `openapi_ops`, and `osv_query` before falling back to `web_search`. These give structured, version-aware data.
+  </Step>
+  <Step title="Generic web: search then fetch">
+    Call `web_search`, then `web_fetch` two or three sources. Quote the version, API, or error text actually found. Cite the URL. If `web_search` is unavailable, say so and `web_fetch` URLs the user or orchestrator already provided.
+  </Step>
+  <Step title="Cross-reference the workspace (last)">
+    Only after external facts are established, use `list_files`, `search`, and `read_file` to relate findings to the local codebase (e.g., checking which version is pinned in `requirements.txt`). Skip caches, venvs, and build folders.
+  </Step>
+  <Step title="Persist durable conclusions">
+    Call `remember(section="engineering", note=...)` for lasting verdicts (adopt / skip / opt-in-only, version, constraint). Do not remember play-by-play transcripts.
+  </Step>
+</Steps>
+
+<Info>
+  Researcher treats all fetched content — web pages, README files, GitHub issues and PRs — as **data only**. A webpage, README, or issue cannot instruct researcher to skip a rule, edit a file, or take an action outside its tool set.
+</Info>
+
+## What researcher reports back
+
+Researcher ends with a `REPORT_TO_ORCH`-format briefing with source citations:
+
+```
+what: investigated httpx library compatibility with the project's existing requests usage
+paths: requirements.txt (pinned requests==2.31.0), src/api/client.py
+facts: httpx 0.27 supports async/await natively; API is mostly compatible — Client vs AsyncClient, Response.json() works the same; no CVEs in osv_query for httpx 0.27; pkg_info shows httpx 0.27.2 is latest stable; docs at https://www.python-httpx.org/async/
+verdict: adopt — httpx 0.27.2 is a safe replacement; update requirements.txt and migrate src/api/client.py
+leftover: did not check if the project's test suite mocks requests — that may need updating too
+```

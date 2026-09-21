@@ -1,0 +1,166 @@
+---
+title: "Prometheus Metrics and Observability in CodeLoom"
+sidebarTitle: "Metrics"
+description: "How CodeLoom Engine pushes per-session Prometheus gauges and histograms to a Pushgateway, which env vars control the integration, and how trace logging works."
+---
+
+Every CodeLoom Engine session creates an isolated `EngineMetrics` instance backed by a dedicated `CollectorRegistry`. Metrics accumulate in-process throughout the session and are pushed asynchronously to a Prometheus Pushgateway whenever significant events occur — LLM completions, tool calls, agent spawns and finishes, and session close. No metrics leave the process unless `ENGINE_PUSHGATEWAY_URL` is set; the registry is always available in-process for testing via `EngineMetrics.sample()`.
+
+## Enabling the Pushgateway integration
+
+Set the following environment variables in `env.sh` or your shell before starting `app.py`:
+
+<ParamField path="ENGINE_PUSHGATEWAY_URL" type="string" required>
+  Base URL of your Prometheus Pushgateway (e.g. `http://localhost:9091`). Leaving this unset silently disables all outbound pushes; metrics still accumulate in-process.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_JOB" type="string" default="engine">
+  Pushgateway job label. When using the A/B benchmark harness, set this to `{prefix}-engine` (e.g. `tui-settings-engine`) to isolate runs on the same dashboard.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_INSTANCE" type="string" default="(session id)">
+  Pushgateway `instance` grouping key. Defaults to the auto-generated session id. Set a stable name like `baseline` or `judge` when comparing runs side-by-side on the same dashboard.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_PUSH_INTERVAL_S" type="float" default="2.0">
+  Minimum seconds between pushes. Turn end, agent finish, and session close always flush immediately regardless of this interval. Negative values are rejected and fall back to `2.0`.
+</ParamField>
+
+```bash title="env.sh"
+export ENGINE_PUSHGATEWAY_URL=http://localhost:9091
+export ENGINE_METRICS_JOB=my-project-engine
+export ENGINE_METRICS_INSTANCE=baseline
+export ENGINE_METRICS_PUSH_INTERVAL_S=2
+```
+
+<Note>
+  `env.sh` is loaded at session start. A variable already set in the shell environment always takes precedence over the file — useful for CI overrides without editing the file.
+</Note>
+
+## Run-level metrics
+
+These gauges track aggregate cost and activity for the entire orchestrator session.
+
+| Metric | Type | Description |
+|---|---|---|
+| `engine_run_info` | Gauge | Always `1`; carries `session_id` and `workspace` labels for dashboard identity |
+| `engine_run_cost_usd` | Gauge | Total LLM cost for this session in USD |
+| `engine_run_tokens{kind}` | Gauge | Session token totals; `kind` ∈ `prompt`, `completion`, `reasoning`, `cached`, `total` |
+| `engine_run_requests` | Gauge | LLM request count for this session |
+| `engine_run_llm_turns` | Gauge | LLM completions counted as session turns |
+| `engine_run_tool_calls` | Gauge | Tool calls finished in this session |
+| `engine_run_files_edited` | Gauge | File edit events (multiple edits to the same file count separately) |
+| `engine_run_files_unique` | Gauge | Distinct file paths edited in this session |
+| `engine_run_agents_spawned` | Gauge | Subagents spawned in this session |
+| `engine_run_agents_live` | Gauge | Currently running subagents |
+| `engine_run_elapsed_seconds` | Gauge | Wall time spent in orchestrator turns |
+| `engine_run_last_turn_cost_usd` | Gauge | LLM cost of the current or last user turn |
+| `engine_run_last_turn_tokens` | Gauge | Tokens of the current or last user turn |
+
+## Agent-level metrics
+
+Each spawned subagent gets its own labeled series. Labels are `profile` (e.g. `coder`, `reviewer`) and `agent_id` (the hex agent identifier).
+
+| Metric | Type | Description |
+|---|---|---|
+| `engine_agent_spawned{profile, agent_id}` | Gauge | Set to `1` when the agent is spawned |
+| `engine_agent_finished{profile, agent_id, status}` | Gauge | Set to `1` when the agent finishes; `status` reflects the completion outcome |
+| `engine_agent_cost_usd{profile, agent_id}` | Gauge | LLM cost attributed to this agent |
+| `engine_agent_tokens{profile, agent_id, kind}` | Gauge | Token counts attributed to this agent; `kind` ∈ `prompt`, `cached`, `total` |
+| `engine_agent_requests{profile, agent_id}` | Gauge | LLM requests attributed to this agent |
+| `engine_agent_duration_seconds{profile, agent_id}` | Gauge | Wall time from spawn to finish |
+
+## Model-level metrics
+
+Cost, tokens, and request counts are broken down by model name so multi-model sessions can be compared directly.
+
+| Metric | Type | Description |
+|---|---|---|
+| `engine_model_cost_usd{model}` | Gauge | Cumulative LLM cost for this model in the session |
+| `engine_model_tokens{model, kind}` | Gauge | Token totals for this model; `kind` ∈ `prompt`, `completion`, `reasoning`, `cached`, `total` |
+| `engine_model_requests{model}` | Gauge | LLM request count for this model |
+
+## Histograms
+
+Histograms record duration distributions rather than totals. They are useful for spotting latency regressions across sessions.
+
+<Tabs>
+  <Tab title="LLM request duration">
+    ```
+    engine_llm_request_duration_seconds{model, profile}
+    ```
+    Wall time for each `complete()` call, bucketed at `1, 2, 5, 10, 20, 30, 60, 120, 300, 600` seconds. Failed calls are counted separately in `engine_llm_errors`.
+  </Tab>
+  <Tab title="Tool execution duration">
+    ```
+    engine_tool_duration_seconds{tool, profile}
+    ```
+    Wall time for each tool execution, bucketed at `0.01, 0.05, 0.1, 0.5, 1, 2, 5, 15, 30, 60, 120` seconds. Also tracked as a count in `engine_tool_calls{tool, profile, ok}`.
+  </Tab>
+</Tabs>
+
+## Counters and error gauges
+
+These metrics surface discrete events that Gauges and Histograms do not capture.
+
+| Metric | Labels | Description |
+|---|---|---|
+| `engine_tool_calls{tool, profile, ok}` | `ok` ∈ `true`/`false` | Finished tool calls by name and outcome |
+| `engine_llm_errors{model, profile}` | — | Failed `complete()` calls |
+| `engine_compactions{profile, strategy}` | — | Context compaction events; `strategy` is the compaction algorithm used |
+| `engine_worktrees_settled{profile, action, ok}` | `ok` ∈ `true`/`false` | Worktree settle outcomes (merge, pr, keep, discard) |
+| `engine_errors{kind}` | `kind` ∈ `llm`, `tool`, `session` | Session errors by category |
+
+## The `StatsUpdated` event
+
+Clients receive a `StatsUpdated` event over the Unix socket whenever the engine updates in-session statistics. The event carries a full `Stats` snapshot — same numbers as the Prometheus gauges, available to the client without polling Grafana. Use it to drive live dashboards or cost guards in a client application.
+
+```json title="StatsUpdated payload (example)"
+{
+  "type": "StatsUpdated",
+  "stats": {
+    "cost": 0.0142,
+    "prompt_tokens": 18400,
+    "completion_tokens": 3200,
+    "reasoning_tokens": 512,
+    "cached_tokens": 9100,
+    "total_tokens": 31212,
+    "requests": 7,
+    "turns": 6,
+    "tool_calls": 23,
+    "elapsed_s": 48.2,
+    "last_turn_cost": 0.0031,
+    "last_turn_tokens": 5210,
+    "agent_runs": [...]
+  }
+}
+```
+
+## Trace logging
+
+Setting `ENGINE_TRACE_CALLS=1` enables full-fidelity JSONL tracing of every tool call (and, on branches with a judge, every judge call). The engine writes one record per call to `.engine/trace.jsonl` in the workspace directory.
+
+<Warning>
+  Trace output is append-only and never read back by the engine. A write failure to `trace.jsonl` is silently ignored — it must never affect a run.
+</Warning>
+
+Each JSONL record includes a `ts` timestamp, a `kind` field, and all relevant request/response fields. Two safety limits keep the file manageable:
+
+- **Field cap:** individual string fields are truncated at **4,000 characters**, with a `…[N more chars]` suffix appended.
+- **Record cap:** if the serialized record still exceeds **16,000 characters** after field truncation, the entire record is replaced with a minimal stub containing `ts`, `kind`, `truncated: true`, and `original_chars`.
+
+```bash title="Enable trace logging"
+export ENGINE_TRACE_CALLS=1
+python app.py /path/to/workspace
+```
+
+```jsonl title=".engine/trace.jsonl (example records)"
+{"ts": 1718000001.23, "kind": "tool", "agent_id": "a1b2c3d4", "tool": "str_replace", "args": {"path": "src/main.py", "old_string": "def foo():", "new_string": "def foo(x: int):"}, "result": "ok"}
+{"ts": 1718000004.87, "kind": "tool", "agent_id": "a1b2c3d4", "tool": "run_command", "args": {"command": "pytest tests/"}, "result": "...truncated..."}
+```
+
+The `bench_ab.py` benchmark harness sets `ENGINE_TRACE_CALLS=1` automatically for both sides of every A/B run, enabling the `bench_flow.py` report to render full request/response detail and model reasoning for each tool call. See [A/B Benchmarking](/operations/benchmarking) for details.
+
+<Tip>
+  Trace files grow quickly on long sessions. Archive or rotate `.engine/trace.jsonl` between runs if you are using a long-lived workspace.
+</Tip>

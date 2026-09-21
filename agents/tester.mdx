@@ -1,0 +1,118 @@
+---
+title: "Tester Agent: Write and Run Tests in Isolation"
+sidebarTitle: "Tester"
+description: "The tester profile creates and runs tests in an isolated worktree, is hard-constrained to TEST_GLOBS paths, and must call run_command at least once — it cannot touch production code."
+---
+
+After a coder lands a change, or when the orchestrator needs to verify existing behavior, the **tester** personality takes over. It runs in its own git worktree, just like coder, but it cannot edit production code: its writes are restricted to a strict set of test-file glob patterns. It must actually invoke the test runner via `run_command` and report what happened — a passing hypothesis without a passing command is not a complete result.
+
+## Purpose
+
+The tester agent proves behavior. Its job covers unit tests, HTTP calls against live APIs, and the project's own end-to-end runner (pytest, Cypress, Playwright, or whatever the repo already has). It reads the code under test before writing tests, runs them, and reports pass/fail/skip counts along with the exact command and any failure output. A test that it cannot fix by editing the test is treated as a product bug, not a test bug — it reports the failure rather than gutting the assertion.
+
+## Tool allowlist
+
+```python title="agents/profiles/tester.py"
+tool_names = NAV + EDIT + SHELL + HTTP + TLDR + ENV + SKILLS + MEMORY
+```
+
+<AccordionGroup>
+  <Accordion title="NAV — filesystem navigation">
+    `list_files`, `read_file`, `search`
+  </Accordion>
+  <Accordion title="EDIT — file editing (test files only)">
+    `str_replace`, `replace_lines`, `insert_at_line`, `create_file`, `replace_symbol`, `insert_after_imports`, `apply_patch`, `rename_symbol`, `undo_edit`, `list_edits`
+  </Accordion>
+  <Accordion title="SHELL — test runner">
+    `run_command` — for invoking pytest, cypress, npx playwright, and similar
+  </Accordion>
+  <Accordion title="HTTP — API testing">
+    `http_request`, `openapi_ops` — preferred over ad-hoc curl for HTTP-level tests
+  </Accordion>
+  <Accordion title="TLDR + ENV — runtime context">
+    `tldr` for test runner flags; `runtime_info` for language and toolchain versions
+  </Accordion>
+  <Accordion title="SKILLS + MEMORY — knowledge base">
+    `activate_skill`, `read_skill`, `remember`
+  </Accordion>
+</AccordionGroup>
+
+<Note>
+  Tester has **no** LSP tools (`goto_definition`, `get_diagnostics`, etc.), no tree-sitter (`SITTER`), no git history tools (`GIT`), no web or GitHub access, and no browser. It is intentionally scoped to test-writing and test-running.
+</Note>
+
+## write\_globs: TEST\_GLOBS restriction
+
+Tester's `write_globs` is set to `list(TEST_GLOBS)` — any write attempt to a path that does not match one of these patterns is rejected outright:
+
+```python title="agents/profile.py"
+TEST_GLOBS = [
+    "**/test_*.py",
+    "**/*_test.py",
+    "**/tests/**",
+    "**/__tests__/**",
+    "**/*.spec.*",
+    "**/*.test.*",
+    "**/cypress/**",
+    "**/e2e/**",
+]
+```
+
+This covers Python unittest/pytest conventions (`test_*.py`, `*_test.py`), JavaScript Jest/Vitest conventions (`*.spec.*`, `*.test.*`, `__tests__/`), Cypress test suites, and generic end-to-end directories.
+
+<Warning>
+  Tester **cannot** edit production code. If fixing a test requires changing source, the tester reports it as a product bug in the briefing — it does not rewrite assertions to match broken behavior, and it does not attempt workarounds in production files.
+</Warning>
+
+## Profile configuration
+
+```python title="agents/profiles/tester.py"
+PROFILE = AgentProfile(
+    name="tester",
+    description=(
+        "Write and run tests in an isolated git worktree (unit, curl, project E2E). "
+        "Cannot edit production code. Must run_command at least once."
+    ),
+    system_prompt=TESTER_SYSTEM,
+    tool_names=NAV + EDIT + SHELL + HTTP + TLDR + ENV + SKILLS + MEMORY,
+    write_globs=list(TEST_GLOBS),    # writes restricted to test file globs
+    required_tools=["run_command"],  # must actually invoke the test runner
+    max_turns=32,
+    needs_worktree=True,             # runs in an isolated git worktree
+    model=EXTRACTOR_MODEL,           # "anthropic/claude-haiku-4.5"
+)
+```
+
+## Model override: EXTRACTOR\_MODEL
+
+Tester is the only built-in profile that overrides the session model. It uses `EXTRACTOR_MODEL = "anthropic/claude-haiku-4.5"` instead of the session's default LLM. This was a deliberate cost decision: the ask briefing is the map the orchestrator and coder run on, and Haiku is an appropriate fit for the more mechanical work of writing and running tests. The comment in `profile.py` explains: *"Ask inherits OPENROUTER\_MODEL — the briefing is the map the orch and coder run on, and Haiku was the wrong place to save money."*
+
+## The required `run_command` call
+
+`required_tools=["run_command"]` means the compactor verifies that `run_command` appeared in the agent's tool call history. If the tester finishes without having run any command, `AgentResult.status` is forced to `"incomplete"` and `missing_checks` lists `"run_command"`. A tester that only writes test files without running them is not complete.
+
+## Worktree isolation
+
+Like coder, tester gets its own linked git checkout at `.engine/worktrees/<agent_id>/` on a branch named `engine/tester/<agent_id>`. This prevents test files from leaking into the user's working directory until the user explicitly merges, opens a PR, keeps, or discards the worktree.
+
+## What tester reports back
+
+Tester ends with a `REPORT_TO_ORCH`-format briefing that includes the exact command run and its outcome:
+
+```
+what: wrote and ran unit tests for the new rate limiting middleware
+paths: tests/test_rate_limit.py (new), tests/conftest.py (modified)
+facts: pytest tests/test_rate_limit.py -v returned 12 passed, 0 failed, 0 skipped; RateLimiter.is_allowed() tested for within-limit, at-limit, and over-limit cases; Redis mock via pytest-redis
+verdict: complete
+leftover: no integration test against a live Redis instance; HTTP-level test for 429 response not written
+```
+
+If a test fails and cannot be fixed by changing the test file, tester flags it as a product bug:
+
+```
+what: attempted to write tests for the payment webhook handler
+paths: tests/test_webhook.py (new)
+facts: pytest tests/test_webhook.py returned 1 failed — AssertionError: signature validation returns True for tampered payload; this is a bug in src/payments/webhook.py verify_signature(), not a test error
+verdict: incomplete
+leftover: production bug in verify_signature() at src/payments/webhook.py:88; pass to debugger or coder
+```

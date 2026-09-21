@@ -1,0 +1,156 @@
+---
+title: "Package Agent Instructions as Reusable Skills"
+sidebarTitle: "Skills"
+description: "SKILL.md files let you bundle instructions into named packages the engine discovers automatically, with lexical ranking, per-agent activation lifetimes, and jailed sibling file reads."
+---
+
+Skills are named instruction bundles that the engine discovers at startup and injects into every agent's context. Each skill is a directory containing a `SKILL.md` file. The model always sees the skill names; it calls `activate_skill` to load a skill's full instructions into its current turn. Clients observe the catalog through `SkillCatalogUpdated` events and can unlock hidden skills session-wide via the `ActivateSkill` command.
+
+## Discovery priority
+
+The engine scans three roots in order, and the **first match on skill name wins**:
+
+1. `{workspace}/.engine/skills/<name>/SKILL.md`
+2. `{workspace}/.cursor/skills/<name>/SKILL.md`
+3. `~/.engine/skills/<name>/SKILL.md`
+
+Each root is sorted alphabetically before scanning, so sibling skill names are stable across runs. Skills found in a higher-priority root shadow any same-named skill in lower-priority roots.
+
+<Note>
+Do not place skills in `~/.cursor/skills-cursor/` — that directory is not scanned.
+</Note>
+
+A typical layout for a workspace skill:
+
+```
+.engine/skills/
+└── docs/
+    ├── SKILL.md
+    ├── reference.md
+    └── scripts/
+        └── check.sh
+```
+
+## SKILL.md format
+
+`SKILL.md` starts with a YAML frontmatter block, followed by the instruction body. The frontmatter is the skill's identity; the body is what agents receive when they activate the skill.
+
+```markdown title=".engine/skills/docs/SKILL.md"
+---
+name: docs
+description: Write or update markdown docs. Use when the user mentions README or docs.
+---
+
+# Docs skill
+
+Only edit markdown files. When adding a new section, check `reference.md` first
+for the canonical terminology. Run `scripts/check.sh` before finishing to
+validate internal links.
+```
+
+### Frontmatter fields
+
+<ParamField body="name" type="string" required>
+  Canonical skill name used in `activate_skill` calls and the catalog listing. Must be unique across all discovered skills. Defaults to the containing directory name if omitted.
+</ParamField>
+
+<ParamField body="description" type="string">
+  Short description shown to the model for lexical ranking. The model uses this to decide whether to call `activate_skill`. Keep it action-oriented and mention the use-case trigger.
+</ParamField>
+
+<ParamField body="disable-model-invocation" type="boolean" default="false">
+  When `true`, the skill name is hidden from the model's catalog until a client sends `ActivateSkill` (session-level unlock) or the agent itself calls `activate_skill(name)`. Use this for skills that should only be enabled by explicit client action.
+</ParamField>
+
+## What the model sees
+
+The engine renders a skill catalog into every agent's system prompt. The catalog lists every discoverable skill name. Descriptions are shown selectively to avoid filling the context window:
+
+- **Lexical top-8**: The eight skills whose `name` and `description` share the most token overlap with the current task query receive their descriptions.
+- **Sticky cap**: Descriptions for skills shown in a previous turn on the same agent are kept visible, up to a cap of 12 total descriptions at once.
+- Skills not in either set are listed by name only.
+
+This ranking is computed by `rank_descriptions()` in `runtime/skills/catalog.py`. Near-ties do not flicker between turns because the sticky set is updated in place.
+
+```
+Available skills (call activate_skill by name):
+- docs: Write or update markdown docs. Use when the user mentions README or docs.
+- testing: Run and fix failing tests in the test suite.
+- api-client
+- migrations
+```
+
+Skills with `disable-model-invocation: true` are excluded from this listing entirely until unlocked.
+
+## Activation lifetimes
+
+Skills can be activated at two different scopes:
+
+<Tabs>
+  <Tab title="Per-agent turn (activate_skill tool)">
+    When an agent calls `activate_skill(name)`, the engine loads the skill body into **that agent's context only**, for the duration of that agent loop. Child agents spawned by the orchestrator do not inherit activated skills.
+
+    ```json
+    {
+      "type": "ToolCall",
+      "name": "activate_skill",
+      "arguments": {"name": "docs"}
+    }
+    ```
+
+    The tool returns the skill body, including a list of sibling files in the skill directory that the agent can read with `read_skill`.
+  </Tab>
+  <Tab title="Session-wide (ActivateSkill command)">
+    Clients send `ActivateSkill` to unlock a skill in the orchestrator's session catalog. This makes the skill name visible to the model on all future agents in the session, overriding `disable-model-invocation`. It does **not** push the skill body into any running agent.
+
+    ```json
+    {"type": "ActivateSkill", "name": "docs"}
+    ```
+  </Tab>
+</Tabs>
+
+<Info>
+Both `activate_skill` and `read_skill` are available in all agent profiles including the orchestrator. `ActivateSkill` (the command) adds the skill to the orch session catalog; it does not automatically push the body into child agents.
+</Info>
+
+## Reading sibling files
+
+Skills often ship with supporting material — reference docs, templates, scripts. The `read_skill` tool reads any file inside the skill's directory. Paths that escape the skill directory (e.g. `../../secrets`) are rejected with an error.
+
+```json
+{
+  "type": "ToolCall",
+  "name": "read_skill",
+  "arguments": {"name": "docs", "path": "reference.md"}
+}
+```
+
+The `path` argument is relative to the skill directory. Subdirectory traversal is allowed as long as the resolved path stays inside the skill root. Sibling file names (excluding `SKILL.md`) are included in the `activate_skill` response so the agent knows what is available.
+
+## SkillRow fields
+
+After discovery or reload, the engine emits `SkillCatalogUpdated` with a list of `SkillRow` objects — one per discovered skill.
+
+<ResponseField name="name" type="string">
+  Skill name from frontmatter.
+</ResponseField>
+
+<ResponseField name="description" type="string">
+  Description from frontmatter. Empty string if not set.
+</ResponseField>
+
+<ResponseField name="source" type="string">
+  Discovery root that provided this skill: `engine`, `cursor`, or `user`.
+</ResponseField>
+
+<ResponseField name="auto" type="boolean">
+  `true` when the skill is visible to the model automatically. `false` when `disable-model-invocation: true` is set.
+</ResponseField>
+
+## Reload
+
+Sending `ReloadIntegrations` re-runs discovery from all three roots and emits a fresh `SkillCatalogUpdated` event. Skills added or removed from disk take effect immediately without restarting the session.
+
+```json
+{"type": "ReloadIntegrations"}
+```

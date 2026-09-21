@@ -1,0 +1,309 @@
+---
+title: "GitHub Tools: Read PRs, Issues, Repos, and Actions"
+sidebarTitle: "GitHub"
+description: "Twenty GitHub tools split between read-only operations (PRs, issues, runs, releases, code search, files) and three approval-gated write operations via the gh CLI."
+---
+
+All GitHub tools are implemented using the [`gh` CLI](https://cli.github.com). The `gh` binary must be installed and authenticated (`gh auth login`) before any of these tools will work. When `gh` is not found, every tool returns `error: gh not installed (https://cli.github.com); authenticate with gh auth login`.
+
+Every tool accepts an optional `repo` parameter in `owner/name` format. When omitted, the tool resolves the repository from the workspace's git remote via `gh repo view`.
+
+<Info>
+Write tools (`gh_pr_comment`, `gh_issue_create`, `gh_pr_create`) always trigger the user approval flow before executing. They cannot be auto-approved.
+</Info>
+
+---
+
+## Read tools
+
+### `gh_pr_list`
+
+```python
+gh_pr_list(ctx: ToolContext, state: str = "open", limit: int = 20, repo: str = "") -> str
+```
+
+Lists pull requests filtered by state.
+
+<ParamField path="state" type="str" default='"open"'>
+  `open`, `closed`, `merged`, or `all`.
+</ParamField>
+
+<ParamField path="limit" type="int" default="20">
+  Maximum PRs to return. Capped at 20 (`LIST_LIMIT`).
+</ParamField>
+
+<ParamField path="repo" type="str" default='""'>
+  `owner/name`. Empty uses the workspace remote.
+</ParamField>
+
+**Return value:** Each PR on multiple lines — number, state, title, author, head branch, and URL. Returns `(none)` when no PRs match.
+
+---
+
+### `gh_pr_view`
+
+```python
+gh_pr_view(ctx: ToolContext, number: int, include_diff: bool = False, repo: str = "") -> str
+```
+
+Shows full PR metadata: title, state, author, base/head branches, body, and a list of changed files.
+
+<ParamField path="number" type="int" required>
+  PR number.
+</ParamField>
+
+<ParamField path="include_diff" type="bool" default="False">
+  When `True`, appends a clipped diff (capped at 20,000 characters, `BODY_CAP`).
+</ParamField>
+
+---
+
+### `gh_pr_comments`
+
+```python
+gh_pr_comments(ctx: ToolContext, number: int, repo: str = "") -> str
+```
+
+Returns all issue comments and review comments on a pull request. Output is capped at 20,000 characters.
+
+---
+
+### `gh_pr_checks`
+
+```python
+gh_pr_checks(ctx: ToolContext, number: int, repo: str = "") -> str
+```
+
+Lists the CI check runs for a PR — name, status, and conclusion.
+
+---
+
+### `gh_issue_list`
+
+```python
+gh_issue_list(ctx: ToolContext, state: str = "open", limit: int = 20, repo: str = "") -> str
+```
+
+Lists issues filtered by state (`open`, `closed`, or `all`). Capped at 20 per call.
+
+---
+
+### `gh_issue_view`
+
+```python
+gh_issue_view(ctx: ToolContext, number: int, repo: str = "") -> str
+```
+
+Shows one issue: number, state, title, author, URL, and body. Body capped at 20,000 characters.
+
+---
+
+### `gh_run_list`
+
+```python
+gh_run_list(ctx: ToolContext, limit: int = 20, repo: str = "") -> str
+```
+
+Lists recent GitHub Actions workflow runs with database ID, name, status, conclusion, branch, event, and URL.
+
+---
+
+### `gh_run_view`
+
+```python
+gh_run_view(ctx: ToolContext, run_id: str, repo: str = "") -> str
+```
+
+Shows one Actions run and appends the log output from failed jobs (capped at 20,000 characters, `RUN_LOG_CAP`).
+
+<ParamField path="run_id" type="str" required>
+  The numeric database ID of the run (from `gh_run_list` output).
+</ParamField>
+
+---
+
+### `gh_release_list`
+
+```python
+gh_release_list(ctx: ToolContext, limit: int = 10, repo: str = "") -> str
+```
+
+Lists recent releases as a tab-separated table (tag, title, published date, type).
+
+---
+
+### `gh_release_view`
+
+```python
+gh_release_view(ctx: ToolContext, tag: str = "", repo: str = "") -> str
+```
+
+Shows one release: tag, name, published date, URL, and release notes body. When `tag` is empty, the latest release is shown.
+
+---
+
+### `github_compare`
+
+```python
+github_compare(ctx: ToolContext, base: str, head: str, repo: str = "") -> str
+```
+
+Compares two refs using the GitHub API (`repos/{owner}/{repo}/compare/{base}...{head}`). Returns ahead/behind counts, status, up to 20 commit SHAs + subjects, and up to 40 changed file names.
+
+<ParamField path="base" type="str" required>
+  Base ref (branch, tag, or SHA).
+</ParamField>
+
+<ParamField path="head" type="str" required>
+  Head ref.
+</ParamField>
+
+---
+
+### `github_search_code`
+
+```python
+github_search_code(ctx: ToolContext, query: str, limit: int = 20, this_repo: bool = False) -> str
+```
+
+Searches public GitHub code using `gh search code`. Supports GitHub code search qualifiers such as `language:`, `path:`, `org:`, and `repo:`.
+
+<ParamField path="query" type="str" required>
+  GitHub code search query string.
+</ParamField>
+
+<ParamField path="limit" type="int" default="20">
+  Maximum results. Capped at 20.
+</ParamField>
+
+<ParamField path="this_repo" type="bool" default="False">
+  When `True`, prepends `repo:owner/name` from the workspace remote so the search is scoped to the current repository.
+</ParamField>
+
+---
+
+### `github_file`
+
+```python
+github_file(ctx: ToolContext, path: str, repo: str = "", ref: str = "", offset: int = 0, limit: int = 12000) -> str
+```
+
+Fetches a raw file from a GitHub repository using the GitHub Contents API.
+
+<ParamField path="path" type="str" required>
+  Path inside the repo (e.g. `src/main.py`).
+</ParamField>
+
+<ParamField path="repo" type="str" default='""'>
+  `owner/name`. Empty uses the workspace remote.
+</ParamField>
+
+<ParamField path="ref" type="str" default='""'>
+  Branch, tag, or SHA. Empty uses the repository's default branch.
+</ParamField>
+
+<ParamField path="offset" type="int" default="0">
+  0-based character offset to start reading from (for pagination).
+</ParamField>
+
+<ParamField path="limit" type="int" default="12000">
+  Maximum characters to return. Default `FILE_WINDOW = 12,000`. Hard cap `FILE_CAP = 50,000`.
+</ParamField>
+
+**Pagination:** The output ends with `...[truncated at N/T; pass offset=N to continue]` when the file is larger than the window. Pass `offset=N` on the next call.
+
+**Directory detection:** If `path` resolves to a directory, the tool returns `error: path is a directory; use github_tree`.
+
+---
+
+### `github_repo`
+
+```python
+github_repo(ctx: ToolContext, repo: str = "") -> str
+```
+
+Returns repository metadata: description, URL, default branch, primary language, license, topics, star count, fork count, last updated, and visibility.
+
+---
+
+### `github_tree`
+
+```python
+github_tree(ctx: ToolContext, repo: str = "", path: str = "", ref: str = "", recursive: bool = False) -> str
+```
+
+Lists files and directories in a GitHub repo path. Each entry shows `file` or `dir`, the path, and file size in bytes.
+
+<ParamField path="path" type="str" default='""'>
+  Directory inside the repo. Empty means the repo root.
+</ParamField>
+
+<ParamField path="recursive" type="bool" default="False">
+  When `True`, walks the entire tree via the Git Trees API (`?recursive=1`). Results are capped at 200 entries (`TREE_CAP`) and skip the same directories as `list_files` (no `node_modules`, `.venv`, etc.).
+</ParamField>
+
+---
+
+## Write tools (approval-gated)
+
+The three write tools below always pause and ask the user for confirmation before executing. They cannot run in `auto` approval mode.
+
+### `gh_pr_comment`
+
+```python
+async gh_pr_comment(ctx: ToolContext, number: int, body: str, repo: str = "") -> str
+```
+
+Posts a comment on a pull request. Requires approval with the prompt: `Allow posting a comment on PR #<number>?`
+
+<ParamField path="number" type="int" required>
+  PR number.
+</ParamField>
+
+<ParamField path="body" type="str" required>
+  Comment body in Markdown.
+</ParamField>
+
+---
+
+### `gh_issue_create`
+
+```python
+async gh_issue_create(ctx: ToolContext, title: str, body: str = "", repo: str = "") -> str
+```
+
+Creates a GitHub issue. Requires approval with the prompt: `Allow creating GitHub issue '<title>'?`
+
+<ParamField path="title" type="str" required>
+  Issue title.
+</ParamField>
+
+<ParamField path="body" type="str" default='""'>
+  Issue body in Markdown.
+</ParamField>
+
+---
+
+### `gh_pr_create`
+
+```python
+async gh_pr_create(ctx: ToolContext, title: str, body: str = "", base: str = "", repo: str = "") -> str
+```
+
+Creates a pull request from the current branch. Requires approval with the prompt: `Allow creating pull request '<title>'?`
+
+<ParamField path="title" type="str" required>
+  PR title.
+</ParamField>
+
+<ParamField path="body" type="str" default='""'>
+  PR body in Markdown. Defaults to the title if empty.
+</ParamField>
+
+<ParamField path="base" type="str" default='""'>
+  Base branch. Empty uses the repository's default branch.
+</ParamField>
+
+<Warning>
+In workflows that use agent worktrees (coder/tester profiles), the orchestrator's worktree settle step owns PR creation. Using `gh_pr_create` directly from a writer agent is redundant and may create duplicate PRs.
+</Warning>

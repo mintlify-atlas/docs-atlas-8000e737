@@ -1,47 +1,210 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with CodeLoom Engine"
+sidebarTitle: "Quickstart"
+description: "Go from zero to your first agent response in minutes: clone the repo, set your OpenRouter key, start the engine, and connect the reference TUI client."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+CodeLoom Engine runs as a long-lived process bound to one workspace directory. Once it is listening on its Unix socket, any client can connect and start driving the LLM coding agent. This guide walks you through the complete flow: prerequisites, installation, configuration, starting the server, connecting the reference client, and understanding the first events you will see.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you start, make sure the following are available on your system.
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+| Requirement | Notes |
+|---|---|
+| **Python 3.9+** | The protocol layer includes explicit fallbacks for Python 3.9's lack of runtime PEP 604 unions. |
+| **OpenRouter API key** | Required for the agent loop. The engine boots without one, but `SubmitUserMessage` will fail with a clear error. |
+| **`rg` (ripgrep)** | Required by the `search` tool. Install via your OS package manager. |
+| **`git`** | Optional but strongly recommended. Enables git state reporting and improves language detection. |
+| **`gh` (GitHub CLI)** | Optional. Enables the `gh_pr_*`, `github_search_code`, and related tools. Authenticate with `gh auth login`. |
+| **Node.js / `npx`** | Optional. Required for the Python (`pyright`) and TypeScript language servers. |
+| **`gopls`** | Optional. Required for Go language server support. |
 
-## Get started
+<Note>
+A Unix-like operating system is required. The transport is an `AF_UNIX` domain socket, which is not available on Windows.
+</Note>
+
+## Installation and first run
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository">
+    Clone the engine source and move into the project directory.
 
     ```bash
-    npm install your-package
+    git clone <your-remote> engine
+    cd engine
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="Create and activate a virtual environment">
+    Isolate the engine's dependencies from the rest of your system.
 
     ```bash
-    your-cli init
+    python3 -m venv .venv
+    source .venv/bin/activate
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Install dependencies">
+    Install all runtime and test dependencies declared in `requirements.txt`.
 
     ```bash
-    your-cli start
+    pip install -r requirements.txt
     ```
+
+    The key runtime packages installed are:
+
+    ```text title="requirements.txt"
+    openrouter>=0.10,<1.0
+    mcp>=1.0
+    tree-sitter>=0.23
+    tree-sitter-python
+    tree-sitter-javascript
+    tree-sitter-typescript
+    tree-sitter-go
+    textual>=1.0
+    prometheus_client>=0.21
+    ```
+  </Step>
+
+  <Step title="Configure your API key">
+    Create a file named `env.sh` in the **workspace root** (the project you want the agent to work on — not the engine directory itself). This file is gitignored by the engine.
+
+    ```bash title="env.sh"
+    export OPENROUTER_API_KEY="sk-or-v1-..."
+    export OPENROUTER_MODEL="anthropic/claude-sonnet-5"
+    ```
+
+    The engine reads `env.sh` from the workspace at startup via `load_env_sh()` in `llm/openrouter.py`. A value already exported in your shell always takes precedence — the file never overwrites an existing environment variable.
+
+    <Tip>
+      Keep `env.sh` out of version control. The engine's write guard explicitly refuses to let any agent write to it, and it is listed in `.gitignore`.
+    </Tip>
+
+    Placeholder values (`...`, `your-key`, `changeme`, `<OPENROUTER_API_KEY>`) are treated as unset by the engine's key validation logic in `runtime/config.py`.
+  </Step>
+
+  <Step title="Start the engine server">
+    Pass the path to the workspace you want the agent to operate on. The current directory is used if you omit the argument.
+
+    ```bash
+    python app.py /path/to/your/project
+    ```
+
+    The server prints a startup banner and then begins listening:
+
+    ```
+    === Engine Server Startup ===
+    workspace: /path/to/your/project
+    engine dir: /path/to/your/project/.engine
+    db path: /path/to/your/project/.engine/session.db
+    socket path: /path/to/your/project/.engine/engine.sock
+    python version: 3.11.9
+    platform: macOS-14.5-arm64
+    ==============================
+    listening on /path/to/your/project/.engine/engine.sock
+    ```
+
+    The engine creates a `.engine/` directory inside the workspace. This is where the Unix socket, the SQLite session database, and workspace memory are stored.
+
+    <Note>
+      `StartSession` rejects a `workspace` path that does not match the one the server was booted with — one process serves exactly one workspace.
+    </Note>
+  </Step>
+
+  <Step title="Connect the reference client">
+    In a second terminal, attach `dummy_client.py`. It opens a three-panel Textual TUI, connects to the socket, and sends `StartSession` automatically on connect.
+
+    ```bash
+    python dummy_client.py /path/to/your/project
+    ```
+
+    The TUI layout looks like this:
+
+    ```
+    +---------------------------+----------------------+
+    |                           | Agents · N           |
+    |                           | nickname / profile   |
+    |  Agent chat               +----------------------+
+    |                           | Protocol             |
+    |                           | commands + events    |
+    |                           +----------------------+
+    |                           | Tools                |
+    |                           | name / args / result |
+    +---------------------------+----------------------+
+    | > type a message or /command   [snapshot] [context]
+    +--------------------------------------------------+
+    ```
+
+    - **Chat (left)** — user, assistant, and `engine` (child reports) messages with streamed deltas and history replay.
+    - **Agents (top right)** — live subagents grouped by batch nickname, with profile, task, status, and current tool.
+    - **Protocol (middle right)** — every command this client sends and inbound non-chat events.
+    - **Tools (bottom right)** — live tool cards with arguments, shell output chunks, status, duration, and a 400-character result preview.
+  </Step>
+
+  <Step title="Send your first message">
+    Type in the input bar at the bottom and press Enter. Anything not recognized as a command is sent as `SubmitUserMessage`.
+
+    ```
+    where is the retry logic in this codebase?
+    ```
+
+    You can also use specific commands:
+
+    ```
+    openfile src/main.py
+    undo
+    ```
+
+    To run the client in headless mode — submit one message and exit when the orchestrator goes idle — use the `--message` and `--auto` flags:
+
+    ```bash
+    python dummy_client.py /path/to/your/project --message "refactor the auth module" --auto
+    ```
+  </Step>
+
+  <Step title="Understand the output">
+    After you submit a message, you will see a sequence of events flowing through the panels. Here is what each one means:
+
+    <Accordion title="AgentStateChanged">
+      Emitted whenever the orchestrator or a subagent changes state. States include `thinking`, `calling_tool`, `waiting_for_user`, `aborting`, `compacting`, and `idle`. The `turn` and `max_turns` fields tell you how deep into the tool-calling budget the agent is.
+    </Accordion>
+
+    <Accordion title="ChatMessageStarted / ChatMessageDelta / ChatMessageAdded">
+      Streaming lifecycle for one assistant reply. `ChatMessageStarted` opens the stream, `ChatMessageDelta` carries incremental text (and optional reasoning), and `ChatMessageAdded` is the canonical complete message. If the `agent_id` field is set, the message comes from a subagent, not the orchestrator.
+    </Accordion>
+
+    <Accordion title="ToolCallStarted / ToolCallFinished">
+      Bracket each tool invocation. `ToolCallFinished` includes the tool name, duration in milliseconds, an `ok` boolean, and a 400-character preview of the result.
+    </Accordion>
+
+    <Accordion title="SnapshotReady">
+      The reconnect payload. Emitted on `StartSession` (and on `RequestSnapshot`). Contains `session_id`, `workspace`, `language`, git state, open files, live agents, and stats. Chat history is **not** packed here — it streams separately as `ChatHistoryAdded` events so large histories do not block the event loop.
+    </Accordion>
+
+    <Accordion title="FileEdited">
+      Emitted whenever an agent write lands. Contains the workspace-relative `path`, the unified `diff`, the `tool` that produced the edit, and an `edit_id` you can use with `UndoLastEdit`.
+    </Accordion>
+
+    <Accordion title="StatsUpdated">
+      Carries cumulative token counts (prompt, completion, cached, reasoning), total cost, elapsed seconds, and per-turn figures. Emitted after every LLM usage event.
+    </Accordion>
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Graceful shutdown
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
-</Tip>
+Send `SIGINT` (Ctrl-C) or `SIGTERM` to the engine process. On the first signal it runs a graceful shutdown: the active session is persisted, all language servers are stopped, any running subagents are aborted, and the socket file is unlinked. A second signal forces an immediate exit.
+
+You can also send `Shutdown` from a connected client, which ends the active session and persists it but leaves the server process running, or type `exit` / `quit` in the TUI to disconnect the client without stopping the server.
+
+## Next steps
+
+<CardGroup cols={2}>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    Full reference for every environment variable, including LLM settings, turn limits, exec approval, and metrics.
+  </Card>
+  <Card title="Protocol reference" icon="plug" href="/protocol">
+    Complete list of commands and events with field-level descriptions for building your own client.
+  </Card>
+</CardGroup>

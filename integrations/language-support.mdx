@@ -1,0 +1,184 @@
+---
+title: "Language Detection and LSP Server Setup"
+sidebarTitle: "Language Support"
+description: "How CodeLoom Engine detects your workspace language from file markers and extension counts, which LSP servers it launches, and how tree-sitter grammars power syntax tools."
+---
+
+CodeLoom Engine performs language detection once at session startup, then uses that result to warm-start an LSP server and load the appropriate tree-sitter grammar. Three languages have full support — Python, Go, and JavaScript/TypeScript. Fourteen more are detected by name but receive no tooling. Workspaces with unsupported or undetected languages still work; the engine emits a `WarningOccurred` event and the agent falls back to `read_file` and `search`.
+
+## Detection algorithm
+
+Detection runs in `runtime/language.py`. The engine builds its file list by preferring `git ls-files` for accuracy, falling back to a recursive filesystem walk capped at 20,000 files. Standard ignore directories are skipped during the walk.
+
+With the file list in hand, the engine applies two complementary signals:
+
+**Extension counting** — every file's suffix is mapped to a language bucket using `_EXTENSIONS`. The most common bucket becomes a candidate.
+
+**Root markers** — the engine looks for well-known files in the workspace root:
+
+| Marker file | Language |
+|---|---|
+| `go.mod`, `go.sum` | Go |
+| `pyproject.toml`, `setup.py`, `setup.cfg`, `requirements.txt`, `Pipfile`, `poetry.lock` | Python |
+| `package.json`, `package-lock.json`, `tsconfig.json`, `jsconfig.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `bun.lockb` | JavaScript/TypeScript |
+
+**Selection logic** — when exactly one marker language is found, it wins unless a different language has at least five files **and** more than twice the marker language's file count. This handles polyglot repositories where an incidental `package.json` would otherwise misidentify a Python project as JavaScript.
+
+## LanguageInfo fields
+
+The result of detection is a `LanguageInfo` dataclass:
+
+<ResponseField name="name" type="string | None">
+  Internal language key: `python`, `go`, or `javascript`. `None` when no language could be identified.
+</ResponseField>
+
+<ResponseField name="supported" type="boolean">
+  `true` when `name` is one of `python`, `go`, or `javascript`. Other detected languages return `false`.
+</ResponseField>
+
+<ResponseField name="file_counts" type="dict[str, int]">
+  Count of files per language bucket across the full workspace scan. Includes unsupported languages (e.g. `rust`, `java`) for diagnostic purposes.
+</ResponseField>
+
+<ResponseField name="warning" type="string | None">
+  Human-readable warning emitted when `supported` is `false`. Describes what was detected and what is supported.
+</ResponseField>
+
+## Supported languages
+
+<CardGroup cols={3}>
+  <Card title="Python" icon="snake">
+    Extensions: `.py`, `.pyi`
+
+    LSP: **Pyright** via `npx -y -p pyright pyright-langserver --stdio`
+
+    tree-sitter grammar: `tree-sitter-python`
+  </Card>
+  <Card title="JavaScript / TypeScript" icon="js">
+    Extensions: `.js`, `.jsx`, `.mjs`, `.cjs`, `.ts`, `.tsx`, `.mts`, `.cts`
+
+    LSP: **typescript-language-server** via `npx -y typescript-language-server --stdio`
+
+    tree-sitter grammars: `tree-sitter-javascript`, `tree-sitter-typescript` (TypeScript and TSX)
+  </Card>
+  <Card title="Go" icon="code">
+    Extensions: `.go`
+
+    LSP: **gopls** via `gopls serve`
+
+    tree-sitter grammar: `tree-sitter-go`
+  </Card>
+</CardGroup>
+
+## Extension-to-grammar mapping
+
+The `EXTENSION_TO_LANG` table in `runtime/tools/sitter.py` maps file suffixes to tree-sitter grammar keys. This governs which grammar is used for syntax queries and the syntax gate:
+
+| Extension | tree-sitter language |
+|---|---|
+| `.py`, `.pyi` | `python` |
+| `.go` | `go` |
+| `.js`, `.jsx`, `.mjs`, `.cjs` | `javascript` |
+| `.ts`, `.mts`, `.cts` | `typescript` |
+| `.tsx` | `typescript_jsx` |
+
+<Note>
+`.tsx` maps to the separate `typescript_jsx` grammar (`language_tsx()` from `tree-sitter-typescript`), not `typescript`. This distinction matters for JSX-aware queries.
+</Note>
+
+## Installing LSP servers
+
+LSP servers are optional. If a server binary is not found, the engine starts without it and LSP tools return descriptive error strings rather than crashing (see [Graceful degradation](#graceful-degradation) below).
+
+<Tabs>
+  <Tab title="Python (Pyright)">
+    Pyright is launched via `npx` and downloaded on first use. You need Node.js installed.
+
+    ```bash
+    # Verify Node.js is available
+    node --version
+
+    # npx downloads pyright automatically on first LSP warm-start.
+    # To pre-install globally:
+    npm install -g pyright
+    ```
+  </Tab>
+  <Tab title="TypeScript / JavaScript">
+    `typescript-language-server` is also launched via `npx`.
+
+    ```bash
+    # Verify Node.js is available
+    node --version
+
+    # npx downloads typescript-language-server automatically.
+    # To pre-install globally:
+    npm install -g typescript-language-server typescript
+    ```
+  </Tab>
+  <Tab title="Go (gopls)">
+    `gopls` must be installed separately and available on `$PATH`.
+
+    ```bash
+    # Install gopls
+    go install golang.org/x/tools/gopls@latest
+
+    # Verify it is on PATH
+    gopls version
+    ```
+  </Tab>
+</Tabs>
+
+## LSP warm-start behaviour
+
+After language detection, the engine starts LSP warm-start on a **daemon thread** so it never blocks the session from accepting commands.
+
+<Steps>
+  <Step title="Server launch">
+    `LSPManager` spawns the server process and sends `initialize`. For JavaScript workspaces, both `javascript` and `typescript` servers are started — they share a single `typescript-language-server` process because their commands are identical.
+  </Step>
+  <Step title="Workspace indexing">
+    The engine opens up to **500** source files by sending `textDocument/didOpen` notifications. This primes cross-file references, type resolution, and diagnostics before any agent tool call.
+  </Step>
+  <Step title="Diagnostics wait">
+    After indexing, the engine waits up to **20 seconds** for the first `textDocument/publishDiagnostics` notifications to arrive. The session proceeds regardless of whether diagnostics arrive in time.
+  </Step>
+</Steps>
+
+### Request timeouts
+
+| Operation | Timeout |
+|---|---|
+| `initialize` | 30 s |
+| Normal LSP request (definition, references, hover) | 15 s |
+| `shutdown` and process exit | 5 s |
+| Warm-start diagnostics wait | 20 s |
+| Diagnostics after a file change | 5 s |
+
+### SHA-based document sync
+
+The `LSPManager` tracks a SHA-256 hash of the text last sent to each server. Before any LSP request, `sync_if_stale()` compares the hash against the current disk content and pushes a `textDocument/didChange` notification if they differ. This means the agent always queries the server against up-to-date file content, even if the file was modified outside the engine's write funnel.
+
+## Graceful degradation
+
+When no LSP server is configured for a file's extension, LSP tools return a descriptive error string instead of raising an exception. The agent can continue working using `read_file`, `search`, and tree-sitter outline tools.
+
+```
+error: No LSP server configured for extension '.rb'
+```
+
+Similarly, when the entire LSP manager is unavailable (server not installed, binary not on `$PATH`), the tool wrapping layer catches the launch failure and returns:
+
+```
+error: LSP server is not running
+```
+
+Tree-sitter tools degrade independently of LSP. If a file's extension is not in `EXTENSION_TO_LANG`, tree-sitter tools return:
+
+```
+error: no tree-sitter grammar for 'path/to/file.rb'
+(extension .rb; supported: python, go, javascript, typescript)
+```
+
+<Tip>
+Even without LSP and tree-sitter, the engine's `search` tool (powered by `ripgrep`) and the full `read_file` / `write_file` funnel remain operational for all languages.
+</Tip>

@@ -1,0 +1,118 @@
+---
+title: "CodeLoom Engine Architecture: From Socket to LLM"
+sidebarTitle: "Overview"
+description: "A full-stack walkthrough of the five component layers — transport, session, agent loop, tools, and storage — and how a user message travels through all of them."
+---
+
+CodeLoom Engine is a **headless AI coding agent backend** that enforces a hard boundary between client interfaces and agent internals. Every interaction crosses a Unix domain socket as newline-delimited JSON; nothing else is shared. The design arranges five vertical layers — transport, session, orchestrator, tool registry, and persistence — so that each layer knows only about the one below it. Understanding this layering is the fastest route to extending, debugging, or connecting to the engine.
+
+## Component stack
+
+The following diagram is taken directly from the project README and shows every major component and how they compose:
+
+```text
+                    ┌──────────────────────────────────────────┐
+   client(s) ──────►│  EngineServer            (runtime/server) │
+   NDJSON over      │  one Unix socket, many concurrent clients │
+   AF_UNIX          │  reads commands  ·  fans out events       │
+                    └────────────────────┬─────────────────────┘
+                                         │ decode_command / encode
+                    ┌────────────────────▼─────────────────────┐
+                    │  EngineSession          (runtime/session) │
+                    │  state · subscribers · snapshots · LSP    │
+                    └────┬──────────────────────────┬───────────┘
+                         │ HANDLERS[type(command)]  │ emits Events
+              ┌──────────▼──────────┐               │
+              │  runtime/commands   │               │
+              │  lifecycle·files·git│               │
+              └──────────┬──────────┘               │
+                         │                          │
+              ┌──────────▼──────────┐               │
+              │ Orchestrator        │───────────────┘
+              │  spawns personalities│
+              └────┬───────────┬────┘
+                   │           │
+      ┌────────────▼──┐   ┌────▼─────────────────────────────┐
+      │ OpenRouterLLM │   │ ToolRegistry  (tools/)           │
+      └───────────────┘   └────┬─────────────────────────────┘
+                               │ every write goes through one funnel
+                          ┌────▼──────────────────────────────┐
+                          │ runtime/tools/edits.py            │
+                          │ stale check → guard → syntax gate │
+                          │ → atomic write → journal → diags  │
+                          └────┬──────────────┬───────────────┘
+                               │              │
+                        ┌──────▼─────┐  ┌─────▼──────────┐
+                        │ SQLite     │  │ LSPManager     │
+                        │ .engine/   │  │ pyright·tsls·  │
+                        │ session.db │  │ gopls          │
+                        └────────────┘  └────────────────┘
+```
+
+<CardGroup cols={2}>
+  <Card title="Transport Layer" icon="plug">
+    `EngineServer` (`runtime/server.py`) owns one `AF_UNIX` socket and multiplexes any number of simultaneous clients onto the single `EngineSession`. Each connection spawns two asyncio tasks: one reading commands, one draining events from a per-client `Subscriber` queue.
+  </Card>
+  <Card title="Session Layer" icon="database">
+    `EngineSession` (`runtime/session.py`) holds all mutable state: open files, chat history, live agent list, stats, and the LSP manager. Every inbound command is dispatched through `HANDLERS[type(command)]`; every outbound event fans out to all subscribers via `session._emit()`.
+  </Card>
+  <Card title="Agent Layer" icon="brain">
+    `Orchestrator` extends `AgentLoop` and is the only component that talks to the LLM. It spawns `Subagent` personalities (ask, coder, tester, researcher, debugger, reviewer) as fire-and-forget asyncio tasks. Writer agents run in isolated git worktrees.
+  </Card>
+  <Card title="Tool Layer" icon="wrench">
+    `ToolRegistry` (`tools/registry.py`) discovers and holds 64 `@tool`-decorated functions. Every agent receives a profile-filtered subset. The write funnel in `runtime/tools/edits.py` is the single path through which all file mutations pass.
+  </Card>
+  <Card title="Persistence Layer" icon="hard-drive">
+    SQLite (`runtime/store/sqlite.py`) stores session snapshots and the edit journal. `memory.json` stores workspace knowledge gathered by agents. Both live inside the `.engine/` directory at the workspace root.
+  </Card>
+  <Card title="Protocol Layer" icon="code">
+    `protocol/` defines the wire contract: `@command` and `@event` dataclasses registered in `COMMANDS` / `EVENTS` dicts, encoded as NDJSON with an 8 MiB line limit. Clients never import engine internals — everything is a `type`-discriminated JSON object.
+  </Card>
+</CardGroup>
+
+## Concurrency model
+
+The engine runs a **single asyncio event loop**. No threads own the event loop; the only work that leaves it is LSP warm-start (a daemon thread so slow `pyright` initialisation never delays the first command) and blocking LSP calls dispatched via `asyncio.to_thread`.
+
+**Per-client tasks.** `EngineServer._on_client` creates two tasks per connection — `_read_commands` and `_write_events`. When either finishes, `asyncio.wait(return_when=FIRST_COMPLETED)` fires and the other is cancelled. `ConnectionError` and `BrokenPipeError` are swallowed; anything else propagates.
+
+**Event fan-out.** `EngineSession._emit` iterates `self._subscribers` and calls `Subscriber.put` on each. `Subscriber` is a bounded deque (default 4096 items / 1 MiB). When capacity is exceeded, droppable events (`ChatMessageDelta`, `CommandOutputChunk`) are evicted first; if the queue still overflows, the oldest item is replaced with an `ErrorOccurred` overflow notice. The client can call `RequestSnapshot` to resync.
+
+**Write lock.** The `EngineSession` owns a single `asyncio.Lock` that every file edit acquires before entering `_apply_sync`. The lock is intentional: the write funnel's `_prepare` / `_commit` / `_apply_sync` path must never `await` mid-write because any suspension would open a read-modify-write race between the staleness check and the atomic replace.
+
+**Subagent concurrency.** Each `Subagent` is an asyncio task. The orchestrator may spawn up to `EngineConfig.max_spawns_per_turn` (default 8) children simultaneously. Writer agents (coder, tester) receive their own `asyncio.Lock` so they can edit files in their isolated worktree without contending on the shared session lock.
+
+## Message flow: socket to LLM to edits to events
+
+The following sequence traces what happens when a user sends a message, from the byte arriving on the socket to the `FileEdited` event flowing back out.
+
+<Steps>
+  <Step title="Command arrives on the socket">
+    `EngineServer._read_commands` calls `reader.readline()`. The raw bytes are decoded by `decode_command(line)` (`protocol/codec.py`), which looks up the `type` field in the `COMMANDS` registry and constructs the matching dataclass. An unrecognised or malformed line becomes an `ErrorOccurred` event — the connection is never dropped.
+  </Step>
+  <Step title="Session dispatches the command">
+    `EngineSession.handle(command)` looks up `HANDLERS[type(command)]` and calls the registered function. For `SubmitUserMessage`, the handler is `lifecycle.submit_user_message`, which calls `session.start_turn(text)`.
+  </Step>
+  <Step title="Turn task created">
+    `start_turn` appends the message to history and either calls `_begin_turn` immediately (if the orchestrator is idle) or enqueues it in `_pending_user` (if a turn is already running). `_begin_turn` creates an asyncio task that calls `self._loop.run(text)` — the orchestrator's main entry point.
+  </Step>
+  <Step title="Orchestrator runs the LLM">
+    `AgentLoop.run(task)` builds the message list (system prompt + memory + skills + conversation history), calls `_complete` to get an `LLMResult`, and either dispatches tool calls or returns the assistant's text. State changes (`thinking`, `calling_tool`, `idle`) are emitted as `AgentStateChanged` events through the `on_state` hook.
+  </Step>
+  <Step title="Tool dispatch">
+    `AgentLoop._dispatch(result)` appends the assistant tool-call message to history, then calls `_execute_call` for each tool. The orchestrator runs tools concurrently (`asyncio.gather`); subagents also run tools concurrently but serialise writes through the write lock. Tool start/finish are announced as `ToolCallStarted` / `ToolCallFinished` events.
+  </Step>
+  <Step title="Write funnel">
+    Any tool that edits files calls `apply_edit(ctx, path, mutate, tool_name)` in `runtime/tools/edits.py`. The funnel acquires the write lock, calls `_prepare` (path guard → staleness check → mutation → syntax gate), then `_commit` (atomic replace → journal record → FileTracker update → `on_edit` callback).
+  </Step>
+  <Step title="Events emitted">
+    `on_edit` calls `EngineSession._on_edit`, which emits `FileEdited` (with a unified diff clipped to the `EVENT_SOFT_LIMIT`) and — if the file is currently open — a `FileContent` refresh. Create/delete/undo also trigger `FileTreeUpdated` and `GitStateUpdated`.
+  </Step>
+  <Step title="Events delivered to clients">
+    `EngineSession._emit` pushes each event onto every `Subscriber` queue. The `_write_events` task for each connected client awaits `queue.get()`, encodes the event as NDJSON, and writes it to the socket. Payloads that exceed the 8 MiB NDJSON line limit are substituted with an `ErrorOccurred` explaining the drop.
+  </Step>
+</Steps>
+
+<Note>
+  Subagent messages stream live as `ChatMessageStarted` / `ChatMessageDelta` / `ChatMessageAdded` with `agent_id` set, but they are **never stored in the orchestrator's chat history**. Only the compressed `AgentResult` (produced by `compress_for_parent`) is posted to the session as an `engine`-role chat line.
+</Note>

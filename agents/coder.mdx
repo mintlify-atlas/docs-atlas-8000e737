@@ -1,0 +1,151 @@
+---
+title: "Coder Agent: Implement Changes in Isolated Worktrees"
+sidebarTitle: "Coder"
+description: "The coder profile applies targeted code edits inside a dedicated git worktree, must call get_diagnostics before finishing, and never merges or pushes — the user decides what to do with the branch."
+---
+
+Once the orchestrator has paths and facts (from workspace memory or an `ask` briefing), it hands the implementation work to the **coder** personality. Coder operates in a dedicated git worktree so its changes are completely isolated from the user's main checkout. It has access to every editing, shell, LSP, and git tool it needs — but it cannot search the internet, cannot open a PR itself, and cannot finish without calling `get_diagnostics` on the files it changed.
+
+## Purpose
+
+The coder agent implements code changes. It trusts the orchestrator's briefing — if the task lists paths, it reads those paths and edits them without re-surveying the repo. It is not a discovery agent and should not run `find`, `grep`, or `ls` as its first step. A path missing from the briefing is a recovery case, not the normal flow.
+
+## Tool allowlist
+
+```python title="agents/profiles/coder.py"
+tool_names = NAV + SITTER + LSP + EDIT + SHELL + GIT + TLDR + ENV + SCAN + SKILLS + MEMORY
+```
+
+<AccordionGroup>
+  <Accordion title="NAV — filesystem navigation">
+    `list_files`, `read_file`, `search`
+  </Accordion>
+  <Accordion title="SITTER — tree-sitter AST queries">
+    `list_symbols`, `find_symbol`, `get_node_at`, `query_tree`, `parse_file`
+  </Accordion>
+  <Accordion title="LSP — language server protocol">
+    `goto_definition`, `find_references`, `hover`, `get_diagnostics`, `document_symbols`
+  </Accordion>
+  <Accordion title="EDIT — all file edit operations">
+    `str_replace`, `replace_lines`, `insert_at_line`, `create_file`, `replace_symbol`, `insert_after_imports`, `apply_patch`, `rename_symbol`, `undo_edit`, `list_edits`
+  </Accordion>
+  <Accordion title="SHELL — command execution">
+    `run_command` — for compiling, running targeted tests, and package manager commands
+  </Accordion>
+  <Accordion title="GIT — history and diff inspection">
+    `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_range`
+  </Accordion>
+  <Accordion title="TLDR + ENV — runtime context">
+    `tldr` for CLI flag lookups; `runtime_info` for language/toolchain version info
+  </Accordion>
+  <Accordion title="SCAN + SKILLS + MEMORY — knowledge base">
+    `todo_scan`, `activate_skill`, `read_skill`, `remember`
+  </Accordion>
+</AccordionGroup>
+
+## Profile configuration
+
+```python title="agents/profiles/coder.py"
+PROFILE = AgentProfile(
+    name="coder",
+    description=(
+        "Implement code changes in an isolated git worktree from a brief that "
+        "already names paths. Has edit tools and run_command. "
+        "Must call get_diagnostics before finishing. Not for repo surveys."
+    ),
+    system_prompt=CODER_SYSTEM,
+    tool_names=NAV + SITTER + LSP + EDIT + SHELL + GIT + TLDR + ENV + SCAN + SKILLS + MEMORY,
+    write_globs=None,                    # unrestricted — may write any path
+    required_tools=["get_diagnostics"],  # must call LSP diagnostics before finish
+    max_turns=32,
+    needs_worktree=True,                 # always runs in an isolated git worktree
+)
+```
+
+<Warning>
+  `write_globs=None` is intentionally unrestricted. Coder is trusted to edit any path in its worktree. Scope control comes from the task briefing and the `get_diagnostics` requirement, not from glob filtering.
+</Warning>
+
+## Worktree isolation
+
+When the orchestrator spawns coder, it calls `add_agent_worktree(workspace, agent_id, "coder")` which runs:
+
+```bash
+git worktree add -b engine/coder/<agent_id> .engine/worktrees/<agent_id>
+```
+
+The child receives `workspace=.engine/worktrees/<agent_id>/` and operates entirely there. Its changes never touch the user's main checkout. The worktree gets its own isolated write lock so concurrent coders on different features cannot race each other.
+
+### Continuing in an existing worktree
+
+If a reviewer requests changes, the fix must happen in the **same** worktree, not a new one. A fresh coder spawn always branches off the original `HEAD` and cannot see the prior writer's diff. Pass `continue_from=<writer_agent_id>` to route the new coder into the existing worktree:
+
+```python
+# Orchestrator tool call
+coder(
+    task="Fix the type error in auth/middleware.py line 42 that reviewer flagged",
+    continue_from="a3f9c2e1..."   # the original writer's agent_id
+)
+```
+
+## The required `get_diagnostics` call
+
+`required_tools=["get_diagnostics"]` means the compactor checks whether `get_diagnostics` appeared in the agent's tool call history before it finishes. If it did not, `AgentResult.status` is forced to `"incomplete"` regardless of the briefing content, and `missing_checks` lists `"get_diagnostics"`.
+
+The system prompt reinforces this: *"You are not done until you have called get_diagnostics on files you changed."*
+
+## System prompt philosophy
+
+The coder system prompt encodes four working principles:
+
+<Steps>
+  <Step title="Trust the briefing">
+    If the task names paths, read and edit them. Do not search the repo, do not run `find`/`grep`/`ls`, do not reopen the architecture question. The orchestrator surveyed; the coder implements.
+  </Step>
+  <Step title="Read before you edit">
+    Always `read_file` a path before touching it — the write funnel requires it. This is verification, not discovery.
+  </Step>
+  <Step title="Match the surrounding style">
+    Before importing a library, confirm it is already used nearby or listed in the manifest (`pyproject.toml`, `requirements.txt`, `package.json`, `go.mod`). One `git_log` or `git_blame` on the file beats guessing at conventions.
+  </Step>
+  <Step title="Do only what was asked">
+    Related cleanups or broader refactors noticed along the way go into the report as `leftover`, not into this edit. Before changing a function signature, `find_references` and update every call site — or name the untouched ones in the report.
+  </Step>
+</Steps>
+
+<Note>
+  If the same fix fails twice, the coder must stop repeating it. Change approach, or write the blocker into the report as `leftover`. A third identical attempt is not progress.
+</Note>
+
+## Worktree settle flow
+
+After coder finishes (and any reviewer on the same tree has also finished), the orchestrator prompts the user with one of four choices:
+
+<Tabs>
+  <Tab title="merge">
+    Runs `git merge --no-edit engine/coder/<agent_id>` on the user's main checkout. Removes the worktree and deletes the branch on success.
+  </Tab>
+  <Tab title="pr">
+    Pushes the branch with `git push -u origin HEAD`, then calls `gh pr create`. Removes the worktree. Returns the pull request URL.
+  </Tab>
+  <Tab title="keep">
+    Leaves the worktree in place at `.engine/worktrees/<agent_id>/`. The user can inspect or apply the changes manually later.
+  </Tab>
+  <Tab title="discard">
+    Removes the worktree with `git worktree remove --force` and deletes the branch with `git branch -D`. Changes are gone.
+  </Tab>
+</Tabs>
+
+The orchestrator's `settle_worktree` tool (registered separately) drives this. Coder never calls merge, push, or `gh pr create` itself.
+
+## What coder reports back
+
+Coder ends with a `REPORT_TO_ORCH`-format briefing:
+
+```
+what: added rate limiting middleware to all /api/* routes
+paths: src/middleware/rate_limit.py (new), src/app.py (modified), tests/test_rate_limit.py (new)
+facts: RateLimiter(requests_per_minute=60) added at line 18 of app.py; uses Redis via the existing redis_client instance; get_diagnostics returned 0 errors after change
+verdict: complete
+leftover: find_references on rate_limit showed one call site in legacy_api.py not yet updated
+```

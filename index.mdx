@@ -1,20 +1,79 @@
 ---
-title: "Introduction"
-description: "Welcome to your project"
+title: "CodeLoom Engine: Headless AI Coding Agent Backend"
+sidebarTitle: "Home"
+description: "CodeLoom Engine runs as a long-lived process exposing a JSON-over-Unix-socket protocol so any client can drive a multi-personality LLM coding agent."
 ---
 
-Write a short description of your product here. What it does, who it's for, and what they can accomplish with it.
+CodeLoom Engine is a headless backend for AI-powered coding agents. It binds to a workspace directory, exposes a newline-delimited JSON (NDJSON) protocol over a Unix domain socket, and lets any client — a TUI, a web app, an editor plugin, or a test harness — drive a full LLM orchestrator without importing a single line of agent internals. The orchestrator spawns named personalities that share 64 tools for reading, searching, understanding, and editing code.
 
-<Tip>
-  Ready to make this your own? Start by editing this page. Update your `docs.json` file to customize your site. Then fill out the [Quickstart](/quickstart) page.
-</Tip>
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Install the engine, set your API key, and send your first message in under five minutes.
+  </Card>
+  <Card title="Configuration" icon="sliders" href="/configuration">
+    All environment variables — models, timeouts, turn limits, exec approval, context budgets.
+  </Card>
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    How the server, session, orchestrator, and tools fit together in one diagram.
+  </Card>
+  <Card title="Protocol Reference" icon="plug" href="/protocol/overview">
+    Every command and event on the NDJSON wire protocol, with fields and examples.
+  </Card>
+</CardGroup>
 
-<Card title="Quickstart" icon="rocket" href="/quickstart">
-  This card links to the quickstart page in your project.
-</Card>
-<Card title="Components" icon="puzzle-piece" href="https://mintlify.com/docs/components">
-  Add cards, callouts, steps, tabs, and more to design and structure your pages.
-</Card>
-<Card title="Settings" icon="gear" href="https://mintlify.com/docs/organize/settings">
-  Set your site name, branding, and navigation in the `docs.json` file.
-</Card>
+## What the engine does
+
+The engine enforces a hard boundary between clients and agent internals. Clients speak JSON over a socket; they never touch the orchestrator, tool registry, or LLM client directly. Every message crossing the socket is a typed dataclass with a `type` field.
+
+<CardGroup cols={3}>
+  <Card title="Multi-agent Orchestration" icon="users">
+    The orchestrator spawns named subagent personalities — ask, coder, tester, researcher, debugger, reviewer — each with its own tool allowlist and optional git worktree isolation.
+  </Card>
+  <Card title="64 Built-in Tools" icon="wrench">
+    Tools span file navigation, tree-sitter AST queries, LSP type information, shell execution, git and GitHub operations, web search, MCP servers, and structured memory.
+  </Card>
+  <Card title="Safe Write Funnel" icon="shield-check">
+    Every file edit goes through read-before-edit enforcement, path guarding, syntax validation via tree-sitter, atomic writes, and a journal-backed undo system.
+  </Card>
+</CardGroup>
+
+## Explore by section
+
+<CardGroup cols={2}>
+  <Card title="Agent Personalities" icon="robot" href="/agents/overview">
+    Learn how each built-in profile is configured — which tools it gets, whether it runs in a git worktree, and what it reports back.
+  </Card>
+  <Card title="Write Funnel" icon="pen-to-square" href="/architecture/write-funnel">
+    Understand the full pipeline that every file edit passes through before bytes hit disk.
+  </Card>
+  <Card title="MCP Servers" icon="server" href="/integrations/mcp-servers">
+    Connect external Model Context Protocol servers and scope their tools to specific agent profiles.
+  </Card>
+  <Card title="Skills" icon="graduation-cap" href="/integrations/skills">
+    Package reusable instructions as SKILL.md files and inject them into any agent's context.
+  </Card>
+  <Card title="Tool Reference" icon="book" href="/tools/navigation">
+    Full parameter documentation for all 64 LLM-callable tools, grouped by family.
+  </Card>
+  <Card title="Extending the Engine" icon="puzzle-piece" href="/extending/adding-a-tool">
+    Add custom tools, agent profiles, skills, and protocol commands without forking the core.
+  </Card>
+</CardGroup>
+
+## Quick look
+
+Start the engine pointed at a workspace, then send JSON commands over the socket:
+
+```bash
+# Start the engine
+python app.py /path/to/your/project
+
+# From another terminal, connect with the reference TUI client
+python dummy_client.py /path/to/your/project
+```
+
+Once connected, any `SubmitUserMessage` command kicks off the full orchestration loop — the engine picks tools, spawns subagents, edits files, and streams back events as NDJSON lines.
+
+<Note>
+  The engine requires Python 3.9+, an OpenRouter API key, and `ripgrep` (`rg`) on your PATH. LSP features additionally need the language server for your project (pyright, typescript-language-server, or gopls).
+</Note>

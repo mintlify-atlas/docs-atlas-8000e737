@@ -1,0 +1,207 @@
+---
+title: "Connect MCP Servers to CodeLoom Engine"
+sidebarTitle: "MCP Servers"
+description: "Configure external tool servers via .engine/mcp.json, handle OAuth token auth, scope servers to agent profiles, and control them with ReloadIntegrations and SetMcpEnabled."
+---
+
+CodeLoom Engine acts as a Model Context Protocol (MCP) **client**. It launches external tool servers as child processes over `stdio`, bridges their tools into the agent tool registry, and exposes them to agents through a family-scoped allowlist. Clients never speak MCP directly — they configure servers in JSON, respond to auth events, and observe status through `McpServersUpdated` events.
+
+## Configuration file
+
+The canonical config file is `.engine/mcp.json` inside your workspace. The engine also reads `.cursor/mcp.json` and merges it in — engine entries win on any name clash, and imported Cursor servers require a one-time trust confirmation stored in `.engine/mcp-trust.json`.
+
+```json title=".engine/mcp.json"
+{
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "${env:GITHUB_TOKEN}"
+      },
+      "profiles": ["researcher", "debugger"],
+      "tokenEnv": "GITHUB_TOKEN",
+      "safeTools": ["search_issues", "list_pull_requests"]
+    },
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres", "${env:DATABASE_URL}"],
+      "env": {
+        "DATABASE_URL": "${env:DATABASE_URL}"
+      },
+      "profiles": ["coder"],
+      "enabled": true
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${workspaceFolder}"],
+      "cwd": "${workspaceFolder}"
+    }
+  }
+}
+```
+
+### Entry fields
+
+Each key inside `mcpServers` is the server name. The value is an object with these fields:
+
+<ParamField body="command" type="string" required>
+  Executable to launch. The server is started as a subprocess with `stdio` transport. v1 only supports `stdio`.
+</ParamField>
+
+<ParamField body="args" type="string[]">
+  Arguments passed to the command.
+</ParamField>
+
+<ParamField body="env" type="object">
+  Environment variables injected into the server process. Values support interpolation tokens (see below).
+</ParamField>
+
+<ParamField body="cwd" type="string">
+  Working directory for the subprocess. Supports interpolation tokens.
+</ParamField>
+
+<ParamField body="enabled" type="boolean" default="true">
+  Set to `false` to disable the server without removing its config. `SetMcpEnabled` writes this field and reloads.
+</ParamField>
+
+<ParamField body="profiles" type="string[]">
+  Agent profiles that can call this server's tools. Defaults to `["researcher", "debugger"]`. See [Profile scoping](#profile-scoping).
+</ParamField>
+
+<ParamField body="tokenEnv" type="string">
+  Name of the environment variable that holds the auth token. The engine reads from this env var when connecting and prompts the user if the value is absent or rejected.
+</ParamField>
+
+<ParamField body="safeTools" type="string[]">
+  Remote tool names that are treated as read-only. These bypass the `PromptBroker` approval step even when `ENGINE_EXEC_APPROVAL` is `auto` or `always`.
+</ParamField>
+
+### Interpolation tokens
+
+String values in `command`, `args`, `env`, and `cwd` support three interpolation tokens:
+
+| Token | Resolves to |
+|---|---|
+| `${env:NAME}` | The value of environment variable `NAME`. A missing variable fails **that server** at load (`status=error`) — no blank secret is ever passed. |
+| `${workspaceFolder}` | Absolute path of the workspace root. |
+| `${userHome}` | Absolute path of the current user's home directory. |
+
+## Merging with `.cursor/mcp.json`
+
+If your workspace has a `.cursor/mcp.json`, the engine imports any server names not already defined in `.engine/mcp.json`. The first time Cursor servers appear, the engine emits a warning and the imported servers start as `disabled` until they are explicitly trusted. Trust is stored in `.engine/mcp-trust.json`. Refused servers stay permanently disabled until that file is edited.
+
+<Note>
+Engine entries always win on name conflicts. Rename a Cursor server in `.engine/mcp.json` if you need a different configuration for it.
+</Note>
+
+## Profile scoping
+
+MCP tools are gated by the `profiles` field on each server config. When an agent loop is bound to a profile, it only receives tools whose `profiles` list includes that profile name.
+
+The `mcp` sentinel is a special token in a profile's `tool_names` list that expands to all live MCP tools allowed for that profile. The default allowlist — used when `profiles` is omitted from a server entry — is `["researcher", "debugger"]`. The `coder` profile does **not** receive MCP tools unless you explicitly add `"coder"` to a server's `profiles`.
+
+Wire names are derived from the server and tool names: `mcp_{server}_{tool}`, with any non-alphanumeric characters replaced by underscores. The engine also synthesises `mcp_list_resources` and `mcp_read_resource` tools into the same `mcp` family. `file://` URIs are rejected by `mcp_read_resource`.
+
+<Warning>
+MCP write tools bypass the engine write funnel. They execute through the external server process and do not go through the staleness check, the syntax gate, or the edit journal. Keep filesystem-like servers off the `coder` profile unless you understand the implications.
+</Warning>
+
+Unannotated MCP tools are treated as destructive. They go through the `PromptBroker` approval step when `ENGINE_EXEC_APPROVAL` is `auto` or `always`. Annotate tools with `readOnlyHint: true` in the MCP server's tool definition, or list them in `safeTools`, to skip that prompt.
+
+## Auth flow
+
+The engine does not open a browser. When a server needs authentication, the sequence is:
+
+<Steps>
+  <Step title="McpAuthRequired event">
+    The engine emits `McpAuthRequired` with the server name and an optional login URL. The server's `status` becomes `needs_auth`.
+  </Step>
+  <Step title="UserPromptRequested event">
+    If `tokenEnv` is set on the server config, the engine also emits `UserPromptRequested` with `kind=mcp_auth`, providing a `prompt_id` for the response.
+  </Step>
+  <Step title="Supply the token">
+    The client responds with either:
+    - `AnswerPrompt { prompt_id, text }` — answers the pending prompt, or
+    - `CompleteMcpAuth { server, token }` — directly stores the token for a named server.
+  </Step>
+  <Step title="Token stored and server reconnected">
+    The token is written to `.engine/mcp-tokens.json` with mode `0600` and injected into the server's `env` under the `tokenEnv` key. The engine reconnects the server automatically.
+  </Step>
+</Steps>
+
+<Note>
+`.engine/mcp-tokens.json` is created with mode `0600` and should be added to `.gitignore` alongside the entire `.engine/` directory.
+</Note>
+
+If a server that was previously authenticated later returns a 401, the engine sets `status=needs_auth` and `error="token rejected; CompleteMcpAuth"`. Use `CompleteMcpAuth` to supply a fresh token — there is no need to call `ReloadIntegrations` in this case.
+
+Without `tokenEnv`, the engine emits `McpAuthRequired` and a warning, but cannot store a token. You must inject the credential manually into the environment before starting the session.
+
+## Commands
+
+### ReloadIntegrations
+
+Rediscovers skills and reconnects all MCP servers. Use this after editing `.engine/mcp.json` directly or after resolving an environment variable that was previously missing.
+
+```json
+{"type": "ReloadIntegrations"}
+```
+
+### SetMcpEnabled
+
+Writes the `enabled` field for a named server into `.engine/mcp.json` and triggers a reload. Use this to toggle a server without editing the file manually.
+
+```json
+{"type": "SetMcpEnabled", "name": "github", "enabled": false}
+```
+
+### CompleteMcpAuth
+
+Provides a token for a server that emitted `McpAuthRequired`. The token is stored in `.engine/mcp-tokens.json` and the server is reconnected immediately.
+
+```json
+{"type": "CompleteMcpAuth", "server": "github", "token": "gho_xxxxxxxxxxxx"}
+```
+
+## McpServerRow status fields
+
+After any server state change, the engine emits `McpServersUpdated` containing a list of `McpServerRow` objects — one per configured server.
+
+<ResponseField name="name" type="string">
+  The server name as declared in `mcpServers`.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  One of: `starting`, `ready`, `disabled`, `needs_auth`, `error`.
+</ResponseField>
+
+<ResponseField name="transport" type="string">
+  Transport type. Always `stdio` in v1.
+</ResponseField>
+
+<ResponseField name="tool_count" type="integer">
+  Number of tools the server exposed after a successful `list_tools` call. Zero when not `ready`.
+</ResponseField>
+
+<ResponseField name="error" type="string">
+  Human-readable error message when `status` is `error` or `needs_auth`. Empty otherwise.
+</ResponseField>
+
+## Troubleshooting
+
+<Accordion title="status=error: unresolved ${env:NAME}">
+  A required environment variable was not set when the config was loaded. Export the variable and send `ReloadIntegrations`, or use `env.sh` to declare it before the session starts.
+</Accordion>
+
+<Accordion title="status=error: unsupported transport">
+  Only `stdio` transport is supported in v1. Remove any `type: "sse"` or `type: "http"` entries from your config.
+</Accordion>
+
+<Accordion title="status=error: mcp server is down; cooling">
+  The server crashed and the engine is in a backoff period. Wait for the cooldown to expire and retry, or send `ReloadIntegrations` to clear the cooldown immediately.
+</Accordion>
+
+<Accordion title="Cursor servers not appearing">
+  Cursor servers require explicit trust. Check `.engine/mcp-trust.json` for the `refused` list and remove the server name from it, then send `ReloadIntegrations`.
+</Accordion>

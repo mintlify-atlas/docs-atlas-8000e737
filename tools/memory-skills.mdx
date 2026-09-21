@@ -1,0 +1,254 @@
+---
+title: "Memory and Skills Tools: Persist Knowledge Across Turns"
+sidebarTitle: "Memory & Skills"
+description: "Five tools for storing workspace facts between turns, loading reusable skill playbooks, scanning for technical debt markers, and controlling a headless Playwright browser."
+---
+
+These tools extend an agent's effective context beyond the current turn. Memory tools write to `.engine/memory.json` in the workspace and persist across sessions. Skill tools load structured playbooks from a catalog. The browser tools provide a headless Chromium session for debugging live UIs.
+
+---
+
+## `remember`
+
+```python
+remember(ctx: ToolContext, section: str, note: str = "", path: str = "", purpose: str = "", entry_points: str = "", constraints: str = "") -> str
+```
+
+Persists a fact to the workspace memory store at `.engine/memory.json`. Facts survive across agent turns and sessions. There are two usage modes depending on `section`:
+
+**File notes** (`section="files"`) annotate a specific file with structured metadata — what it does, where to start reading, and what invariants to preserve. The note is keyed to the file's SHA-256 hash and is automatically marked `STALE` if the file is later edited.
+
+**Decision bullets** (`section` = `engineering`, `product`, `cicd`, or `other`) append a free-text decision to a rolling list. Each section retains the most recent 12 decisions (`SECTION_CAP`).
+
+### Parameters
+
+<ParamField path="section" type="str" required>
+  One of: `files`, `engineering`, `product`, `cicd`, `other`.
+</ParamField>
+
+<ParamField path="note" type="str" default='""'>
+  For decision sections: the decision text to append (max 400 characters, `NOTE_CLIP`). For `files`: used as `purpose` when `purpose` is omitted.
+</ParamField>
+
+<ParamField path="path" type="str" default='""'>
+  **Required when `section="files"`.** Workspace-relative path of the file to annotate.
+</ParamField>
+
+<ParamField path="purpose" type="str" default='""'>
+  What this file is for (max 200 characters, `FIELD_CLIP`). Used only with `section="files"`.
+</ParamField>
+
+<ParamField path="entry_points" type="str" default='""'>
+  Symbols or functions to start from when reading the file (max 200 characters). `section="files"` only.
+</ParamField>
+
+<ParamField path="constraints" type="str" default='""'>
+  Invariants that future edits must preserve (max 200 characters). `section="files"` only.
+</ParamField>
+
+### Return value
+
+`ok` on success. Error strings include:
+
+- `error: files section requires path` — `path` was empty with `section="files"`.
+- `error: note is empty` — no content provided.
+- `error: missing file: <path>` — the file does not exist on disk.
+- `error: section must be files, engineering, product, cicd, or other` — invalid section name.
+
+### Memory store internals
+
+The store caps itself at 40 annotated files (`FILE_NOTE_CAP`) and 12 entries per decision section. When caps are exceeded, oldest entries are pruned. File notes whose `note_sha` no longer matches the on-disk SHA are flagged `STALE` when the memory is rendered; the record is automatically dropped the next time the file is missing from disk.
+
+### Examples
+
+```python
+# Annotate a key file
+remember(
+    ctx,
+    section="files",
+    path="runtime/config.py",
+    purpose="Central EngineConfig dataclass; all env-var wiring lives here",
+    entry_points="EngineConfig, EngineConfig.from_env",
+    constraints="Do not add non-optional fields without updating from_env and tests"
+)
+
+# Record an architectural decision
+remember(
+    ctx,
+    section="engineering",
+    note="Moved timeout config from env to EngineConfig.exec_timeout_s; do not re-add env var"
+)
+```
+
+---
+
+## `activate_skill`
+
+```python
+activate_skill(ctx: ToolContext, name: str) -> str
+```
+
+Loads the `SKILL.md` body of a named skill from the engine's skill catalog into the current agent context. Skills are reusable playbooks — structured instructions for recurring task patterns. After activation, the skill's sibling files (templates, configs, examples) are listed and accessible via `read_skill`.
+
+### Parameters
+
+<ParamField path="name" type="str" required>
+  Skill name from the catalog. Use the catalog listing to discover available skills.
+</ParamField>
+
+### Return value
+
+The full text of `SKILL.md` for the named skill, followed by:
+
+```
+Sibling files: schema.json, template.py, examples/
+```
+
+Returns `error: unknown skill <name>` when the skill is not in the catalog, or `error: skills are not available` when the skills feature is not configured for the session.
+
+---
+
+## `read_skill`
+
+```python
+read_skill(ctx: ToolContext, name: str, path: str) -> str
+```
+
+Reads one sibling file from the directory of an activated skill. The `path` argument is jail-checked: it cannot escape the skill's directory via `..` traversal.
+
+### Parameters
+
+<ParamField path="name" type="str" required>
+  Skill name (same as used in `activate_skill`).
+</ParamField>
+
+<ParamField path="path" type="str" required>
+  Filename or subdirectory path within the skill directory (e.g. `schema.json`, `examples/basic.py`).
+</ParamField>
+
+### Return value
+
+The file contents as a string. Returns an error if the path escapes the skill directory or the file does not exist.
+
+---
+
+## `todo_scan`
+
+```python
+todo_scan(ctx: ToolContext, path: str = "", pattern: str = "") -> str
+```
+
+Scans for technical debt markers using ripgrep. By default, searches for `TODO`, `FIXME`, `XXX`, and `HACK` in comments. The same directory skip-list as `list_files` applies — caches, venvs, and vendor directories are excluded.
+
+### Parameters
+
+<ParamField path="path" type="str" default='""'>
+  Optional workspace-relative file or directory to restrict the scan. Empty scans the entire workspace.
+</ParamField>
+
+<ParamField path="pattern" type="str" default='""'>
+  Optional custom regex to replace the default `TODO|FIXME|XXX|HACK` pattern. When provided, the custom pattern is used exclusively.
+</ParamField>
+
+### Return value
+
+```
+src/main.py:42:    # TODO: handle timeout edge case
+runtime/session.py:118:    # FIXME: race condition when session closes
+agents/loop.py:77:    # XXX: magic number 3
+```
+
+Results are in `path:line:text` format, capped at 80 hits (the same `DEFAULT_MAX_MATCHES` as `search`). Returns `(no matches)` when none are found.
+
+---
+
+## Browser tools
+
+The browser tools provide a shared headless Chromium session via [Playwright](https://playwright.dev). They are intended for the `debugger` agent profile to investigate live UI state — inspecting console errors, capturing screenshots, and monitoring network failures. All four tools share a single global page and sequential lock, so calls are serialized.
+
+<Warning>
+Browser tools return `error: browser tools unavailable (install playwright and run playwright install chromium)` when Playwright is not installed. They are optional — the rest of the engine works without them.
+</Warning>
+
+### `browser_open`
+
+```python
+async browser_open(url: str) -> str
+```
+
+Navigates the headless browser to `url`, waiting for `domcontentloaded`. **Resets** both the console log buffer and the network failure buffer from any previous navigation.
+
+<ParamField path="url" type="str" required>
+  `http` or `https` URL to navigate to.
+</ParamField>
+
+**Return value:** `opened <final-url> title='<page title>'` on success. Returns an error string on navigation failure (e.g. DNS failure, timeout after 30 seconds).
+
+---
+
+### `browser_console`
+
+```python
+async browser_console() -> str
+```
+
+Returns up to 80 captured browser console messages since the last `browser_open` call. Messages are formatted as `<type>: <text>` where type is `log`, `warn`, `error`, `info`, etc.
+
+**Return value:** Newline-separated console messages, or `(no console messages)` if the log is empty.
+
+---
+
+### `browser_screenshot`
+
+```python
+async browser_screenshot(ctx: ToolContext, name: str = "shot.png") -> str
+```
+
+Takes a full-page screenshot and saves it to `.engine/debug/<name>` in the workspace. The file is **not** sent to the model — only the saved path is returned.
+
+<ParamField path="name" type="str" default='"shot.png"'>
+  Filename under `.engine/debug/`. A `.png` extension is appended if absent.
+</ParamField>
+
+**Return value:** `saved .engine/debug/<name>` on success.
+
+---
+
+### `browser_network`
+
+```python
+async browser_network() -> str
+```
+
+Returns up to 80 network events since the last `browser_open` that represent failures or HTTP 4xx/5xx responses. Successful requests are not reported.
+
+**Format:**
+```
+FAIL GET https://api.example.com/data net::ERR_CONNECTION_REFUSED
+404 GET https://cdn.example.com/bundle.js
+500 POST https://api.example.com/submit
+```
+
+Returns `(no failed or 4xx/5xx requests)` when all network traffic was clean.
+
+---
+
+## Browser workflow example
+
+```python
+# 1. Open the app
+browser_open("http://localhost:3000")
+# → opened http://localhost:3000/ title='My App'
+
+# 2. Check for JS errors
+browser_console()
+# → error: TypeError: Cannot read properties of undefined (reading 'map')
+
+# 3. Capture the visual state
+browser_screenshot(ctx, "after-load.png")
+# → saved .engine/debug/after-load.png
+
+# 4. Check for API failures
+browser_network()
+# → 500 GET http://localhost:3000/api/users
+```

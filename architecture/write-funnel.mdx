@@ -1,0 +1,224 @@
+---
+title: "The Write Funnel: Safe File Editing Pipeline"
+sidebarTitle: "Write Funnel"
+description: "Every stage a file edit passes through before bytes hit disk — path guard, staleness check, mutation, syntax gate, atomic write, journal record, LSP sync, and the on_edit callback."
+---
+
+Every file write in CodeLoom Engine flows through a single module: `runtime/tools/edits.py`. Tools supply a pure `str → str` mutation function; the funnel wraps it with every safety mechanism the engine provides. A tool author who calls `apply_edit` inherits staleness detection, path guarding, newline and encoding preservation, a tree-sitter syntax check, an atomic disk write, a journal entry, LSP diagnostic sync, and full undo support — for free.
+
+The funnel's synchronous core (`_prepare` / `_commit` / `_apply_sync`) is deliberately **await-free**. On a single asyncio event loop, any uninterrupted stretch of synchronous code is effectively atomic. Inserting an `await` inside those functions would silently reintroduce a read-modify-write race between the staleness check and the final `os.replace`.
+
+## The pipeline
+
+<Steps>
+  <Step title="Profile write-path check">
+    Before anything else, `apply_edit` calls `_profile_write_error(ctx, path)` which evaluates `write_allowed(rel, ctx.write_globs)` from `runtime/tools/writeglob.py`. Each `AgentProfile` declares a `write_globs` list — glob patterns the profile is permitted to write. The orchestrator gets an empty list (no writes at all); coder and tester get broad patterns; ask and researcher get nothing.
+
+    ```python
+    # runtime/tools/writeglob.py
+    def write_allowed(rel: str, globs: list[str] | None) -> bool:
+        if globs is None:    # None = unrestricted
+            return True
+        if not globs:        # [] = no writes allowed
+            return False
+        ...  # fnmatch against each pattern
+    ```
+
+    A denied path returns `error: profile {profile} cannot write {rel}` immediately, before the write lock is acquired.
+  </Step>
+
+  <Step title="Acquire the write lock">
+    `apply_edit` acquires `ctx.write_lock` (an `asyncio.Lock`) before entering `_apply_edit_body`. The session holds one shared lock for the main workspace; each isolated writer worktree gets its own lock so two coders can write their separate worktrees in parallel without contending.
+  </Step>
+
+  <Step title="Path guard (`guard_write_path`)">
+    `guard_write_path(workspace, path)` in `runtime/tools/fileid.py` refuses writes before any bytes move:
+
+    ```python
+    # runtime/tools/fileid.py — guard_write_path
+    if os.path.lexists(candidate) and os.path.islink(candidate):
+        raise WorkspacePathError("refusing to write through a symlink")
+    resolved = candidate.resolve()
+    try:
+        rel = resolved.relative_to(workspace)   # path traversal check
+    except ValueError:
+        raise WorkspacePathError("path is outside the workspace")
+    for part in rel.parts:
+        if should_skip_name(part):
+            raise WorkspacePathError(f"writes to {part}/ are not allowed")
+    ```
+
+    The **denylist** enforced by `should_skip_name`:
+
+    | Category | Names |
+    |---|---|
+    | VCS | `.git` |
+    | Engine internals | `.engine`, `.cursor` |
+    | Build / cache | `__pycache__`, `node_modules`, `.venv`, `venv`, `.ruff_cache` |
+    | Lockfiles | `package-lock.json`, `uv.lock`, `poetry.lock`, `Cargo.lock`, `go.sum` |
+    | Secrets | `env.sh`, `.env`, `.env.*` |
+
+    Resolution happens first, then `relative_to`, so `../` traversal attempts and symlink escapes both fail.
+  </Step>
+
+  <Step title="Read source (`read_source`) and staleness check">
+    For existing files, `read_source(workspace, path)` reads the file bytes, decodes them, and returns a `FileSource` dataclass that captures:
+
+    - `rel` — workspace-relative POSIX path
+    - `text` — normalised (LF-only) content
+    - `raw_sha256` — SHA-256 of the raw bytes as read from disk
+    - `newline` — detected line ending (`\n`, `\r\n`, or `\r`)
+    - `trailing_newline` — whether the file ends with a newline
+    - `encoding` — `utf-8` or `utf-8-sig` (BOM-bearing)
+    - `indent` — detected dominant indent string (tab or 2/3/4/8 spaces)
+
+    Non-UTF-8 files raise `WorkspacePathError("file is not valid UTF-8")` rather than silently mangling them.
+
+    `_tracker_check(ctx, src)` then consults the `FileTracker`:
+
+    ```python
+    # runtime/tools/edits.py
+    def _tracker_check(ctx: ToolContext, src: FileSource) -> None:
+        recorded = ctx.files.get(src.rel)
+        if recorded is None:
+            raise EditError(f"error: read {src.rel} before editing it")
+        if recorded != src.raw_sha256:
+            raise EditError(
+                f"error: {src.rel} changed on disk since you read it ..."
+            )
+    ```
+
+    No recorded SHA → the agent hasn't `read_file`'d the path yet. A SHA mismatch → the file changed on disk after the agent read it. Both are hard errors.
+  </Step>
+
+  <Step title="Apply the mutation">
+    `mutate(src)` is called with the `FileSource`. Tools supply domain-specific logic here: `str_replace` for substring replacement, `replace_lines` for a numbered window, `hunks_to_text` for a unified diff patch, and so on. The mutation receives normalised (LF-only) text and must return normalised text. Any `ValueError` is wrapped as an `EditError`.
+  </Step>
+
+  <Step title="Syntax gate (tree-sitter ERROR comparison)">
+    `syntax_gate(src.rel, new_text, src.text)` in `runtime/tools/sitter.py` parses both the old and new text with tree-sitter and counts `ERROR` and `MISSING` nodes. The edit is rejected only if the **new** text has more error nodes than the old text.
+
+    ```python
+    # The key invariant: a broken file can still be edited.
+    # Only newly introduced breakage is blocked.
+    gate = syntax_gate(src.rel, new_text, src.text)
+    if gate:
+        raise EditError(gate)
+    ```
+
+    This asymmetry means an agent can fix a syntax error (fewer errors after → allowed) but cannot introduce a new one (more errors after → blocked). For file types with no tree-sitter grammar, the gate is a no-op.
+  </Step>
+
+  <Step title="File identity preservation (`render`)">
+    `render(src, new_text)` re-applies the original file's identity to the normalised new text:
+
+    - Replaces `\n` with `src.newline` (restoring CRLF or bare CR if that was the original)
+    - Adds or removes the trailing newline to match `src.trailing_newline`
+    - Prepends the UTF-8 BOM if `src.encoding == "utf-8-sig"`
+    - Encodes to `bytes` using UTF-8
+
+    New files inherit identity from a sibling with the same extension via `identity_from_sibling(resolved.parent, resolved.suffix)`, so a new `.py` file next to CRLF Python files gets CRLF too.
+  </Step>
+
+  <Step title="Atomic write">
+    For **edits** to existing files:
+    ```python
+    # _atomic_replace: write to tmp, fsync, os.replace into position
+    fd, tmp = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=...)
+    os.write(fd, data)
+    os.fsync(fd)
+    os.close(fd)
+    os.replace(tmp_path, target)  # atomic on POSIX
+    ```
+
+    For **creates**:
+    ```python
+    # _atomic_create: write to tmp, hard-link into position
+    os.link(tmp_path, target)   # fails if target exists → no clobber race
+    ```
+
+    `os.replace` is atomic on POSIX — a reader never sees a half-written file. The hard-link approach for creates ensures that a concurrent create attempt gets `FileExistsError` rather than silently overwriting.
+  </Step>
+
+  <Step title="Journal record">
+    `journal.record(db_path, ...)` inserts a row into the `edits` table in `session.db`:
+
+    | Column | Contents |
+    |---|---|
+    | `id` | Autoincrement primary key |
+    | `session_id` | Owning session |
+    | `batch_id` | Groups multi-file edits (e.g. a server-side rename across files) |
+    | `path` | Workspace-relative POSIX path |
+    | `tool` | Tool name that produced the edit |
+    | `before` / `after` | Full byte snapshots; `NULL before` = create; `NULL after` = delete |
+    | `before_sha` / `after_sha` | SHA-256 of each side |
+    | `diff` | Unified diff string |
+    | `created_dirs` | JSON array of directories created for this edit |
+    | `applied_at` | ISO-8601 UTC timestamp |
+
+    Storing full `before`/`after` bytes rather than diffs makes undo exact and independent of patch application.
+
+    After the journal record, `ctx.files.mark(rel, after_sha)` updates the `FileTracker` with the new SHA so subsequent reads by the same agent see a fresh baseline.
+  </Step>
+
+  <Step title="LSP sync and diagnostic diff">
+    After `_commit` returns, `_lsp_after(ctx, result, before)` runs in a thread via `asyncio.to_thread`. It calls `lsp.diagnostics_after_change(result.rel, result.new_text)`, which notifies the language server of the new content and returns the updated diagnostics. `_new_diagnostics(before, after)` diffs the two lists; only newly introduced errors/warnings are included in the tool result so the model sees actionable signal, not a wall of pre-existing noise.
+  </Step>
+
+  <Step title="`on_edit` callback">
+    `ctx.on_edit(result.rel, result.diff, tool_name, result.edit_id)` is called if the edit produced a diff. In `EngineSession`, this emits:
+
+    - `FileEdited` — with the unified diff clipped to `EVENT_SOFT_LIMIT` (512 KiB)
+    - `FileContent` — refreshed full content if the file is currently open
+    - `FileTreeUpdated` — for creates, undos, deletes, and renames
+    - `GitStateUpdated` — to update the diff panel in connected clients
+  </Step>
+</Steps>
+
+## Undo
+
+`undo_edit` (exposed as the `undo_edit` tool and the `UndoLastEdit` command) calls `undo_last_sync(ctx)` which loads `journal.last_batch(db, session_id)` and reverses it newest-record-first:
+
+```python
+# runtime/tools/edits.py — undo_last_sync (simplified)
+for rec in reversed(batch):
+    current_sha = sha256_bytes(target.read_bytes()) if target.is_file() else None
+    if current_sha != rec.after_sha:
+        return ApplyResult(
+            ok=False,
+            message="error: {rec.path} changed on disk since the edit; refusing to clobber"
+        )
+```
+
+Before touching anything, undo verifies that each file's current SHA matches the recorded `after_sha`. If you edited a file by hand after the agent touched it, undo refuses rather than discarding your changes.
+
+Reversals are **all-or-nothing**. A partial rollback failure leaves all files unchanged. The undo itself is recorded as a new batch with `tool="undo_edit"` so history stays append-only and the undo can itself be undone.
+
+<Note>
+  Multi-file batches are common for server-side renames (`rename_symbol`) where a single logical operation touches many files. The batch is identified by a shared `batch_id` UUID, and undo processes every record in that batch together.
+</Note>
+
+## CRLF / BOM / indent identity preservation
+
+`FileSource` captures how a file is actually encoded on disk. The mutation sees normalised LF-only text; `render` re-applies the original identity on the way out:
+
+```python
+# runtime/tools/fileid.py — render
+def render(src: FileSource, new_text: str) -> bytes:
+    text = new_text.replace("\r\n", "\n").replace("\r", "\n")  # normalise
+    if src.trailing_newline:
+        if text and not text.endswith("\n"):
+            text += "\n"
+    elif text.endswith("\n"):
+        text = text[:-1]                        # preserve no-trailing-newline
+    body = text.replace("\n", src.newline).encode("utf-8")  # restore CRLF/CR
+    if src.encoding == "utf-8-sig":
+        return _BOM + body                      # restore BOM
+    return body
+```
+
+A CRLF file stays CRLF. A BOM-bearing file keeps its BOM. A file with no final newline keeps not having one. Mutations never need to know about any of this.
+
+<Tip>
+  The write funnel is deliberately not async inside `_apply_sync`. Tool authors should never `await` inside a `mutate` function. Any async work (LSP calls, user prompts) must happen before or after calling `apply_edit`, not inside the mutation.
+</Tip>

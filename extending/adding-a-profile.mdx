@@ -1,0 +1,292 @@
+---
+title: "Create a Custom Subagent Personality Profile"
+sidebarTitle: "Adding a Profile"
+description: "Define an AgentProfile dataclass, configure tool allowlists and write_globs, and let the engine auto-discover your new subagent personality on the next StartSession."
+---
+
+Profiles are how you teach the engine a new personality. Each profile becomes a tool the orchestrator can call by name — the orch sees `ask(task=...)`, `coder(task=...)`, or your own `auditor(task=...)` as first-class choices. The entire registration step is: create a file, export `PROFILE`, restart (or call `discover_profiles()` in a test).
+
+There is no registry file to edit. `discover_profiles()` in `agents/profile.py` walks every module under `agents/profiles/`, imports it, and collects any module-level `PROFILE` that is an `AgentProfile` instance.
+
+<Note>
+  The orchestrator is the planner. Profiles are specialists. A profile that tries to do everything the orch does — survey, plan, and write — is almost always the wrong design. Keep personalities narrowly focused: a reader reads, a writer writes.
+</Note>
+
+## AgentProfile dataclass
+
+All fields are defined in `agents/profile.py`:
+
+```python title="agents/profile.py"
+@dataclass
+class AgentProfile:
+    name: str
+    description: str
+    system_prompt: str
+    tool_names: list[str]
+    write_globs: list[str] | None = None
+    required_tools: list[str] = field(default_factory=list)
+    max_turns: int = 32
+    model: str | None = None
+    temperature: float = 0.2
+    needs_worktree: bool = False
+    join_worktree: bool = False
+```
+
+<ParamField path="name" type="str" required>
+  The tool name the orchestrator uses. Must be unique across all profiles. This becomes the wire name in the LLM's tool call.
+</ParamField>
+
+<ParamField path="description" type="str" required>
+  Shown to the orchestrator so it can choose between personalities. Be specific about what this personality **will not** do — the orch uses this to avoid mis-routing.
+</ParamField>
+
+<ParamField path="system_prompt" type="str" required>
+  The child agent's only system prompt (plus workspace memory rendered from `.engine/memory.json`). Subagents freeze this text on the first model call to keep prompt-cache prefixes stable.
+</ParamField>
+
+<ParamField path="tool_names" type="list[str]" required>
+  Allowlist of tool names drawn from `discover_tools()`. Unknown names become registry errors, not crashes. Never include other personality names in this list. Include `MEMORY` (`remember`) unless the personality truly has nothing to persist.
+</ParamField>
+
+<ParamField path="write_globs" type="list[str] | None" default="None">
+  `None` means any workspace path the write funnel already allows (unrestricted). `[]` means no writes at all even if an edit tool appears in `tool_names`. A list of glob patterns is matched against the relative path — e.g. `["**/*.md", "docs/**"]`.
+</ParamField>
+
+<ParamField path="required_tools" type="list[str]" default="[]">
+  If any of these tool names never appear in the child's tool trace, `AgentResult.status` comes back `"incomplete"`. This is a soft signal — the child still exits normally. Used by `coder` (`get_diagnostics`) and `tester` (`run_command`).
+</ParamField>
+
+<ParamField path="max_turns" type="int" default="32">
+  The child's own turn cap, independent of the orchestrator. Hitting it triggers a continue prompt (same child), a handoff (orch may spawn a writer with leftover), or a stop, depending on `ENGINE_TURN_CONTINUE`.
+</ParamField>
+
+<ParamField path="model" type="str | None" default="None">
+  Optional OpenRouter model ID for this personality. Profiles that leave this unset inherit `OPENROUTER_CHILD_MODEL` (if set) or `OPENROUTER_MODEL`.
+</ParamField>
+
+<ParamField path="temperature" type="float" default="0.2">
+  Sampling temperature passed to the LLM provider.
+</ParamField>
+
+<ParamField path="needs_worktree" type="bool" default="false">
+  If `true`, the child runs in a git worktree on a new branch under `.engine/worktrees/` so concurrent writers don't collide. Set this for any personality that edits application code. When the child finishes, its changes are committed on the writer branch and the user is prompted to merge, open a PR, keep, or discard.
+</ParamField>
+
+<ParamField path="join_worktree" type="bool" default="false">
+  If `true`, the child reuses a live writer worktree from the same batch instead of creating its own. Use this for reviewers — `reviewer` sets this so it sees the writer's diff. If no worktree is open, the child falls back to the main checkout.
+</ParamField>
+
+## Tool name group constants
+
+`agents/profile.py` exports named lists you can compose as `tool_names`:
+
+```python title="agents/profile.py (constants)"
+NAV    = ["list_files", "read_file", "search"]
+SITTER = ["list_symbols", "find_symbol", "get_node_at", "query_tree", "parse_file"]
+LSP    = ["goto_definition", "find_references", "hover", "get_diagnostics", "document_symbols"]
+EDIT   = ["str_replace", "replace_lines", "insert_at_line", "create_file",
+          "replace_symbol", "insert_after_imports", "apply_patch",
+          "rename_symbol", "undo_edit", "list_edits"]
+SHELL  = ["run_command"]
+WEB    = ["web_search", "web_fetch"]
+GIT    = ["git_status", "git_diff", "git_log", "git_show", "git_blame", "git_range"]
+GH_READ = GH_SOCIAL + GH_REPO    # read-only GitHub tools
+BROWSER = ["browser_open", "browser_console", "browser_screenshot", "browser_network"]
+MEMORY  = ["remember"]
+SKILLS  = ["activate_skill", "read_skill"]
+```
+
+Mix and match: `tool_names = NAV + SITTER + LSP + EDIT + SHELL + GIT + MEMORY + SKILLS` is how `coder` is built.
+
+## Hard constraints vs prompt-only constraints
+
+<Warning>
+  **The system prompt does not enforce boundaries — `write_globs` does.** If you want a personality to stay read-only or to only touch certain paths, you must set `write_globs` appropriately. A system prompt saying "never edit application code" is a hint to the model, not a hard rule. The write funnel rejects anything outside `write_globs` regardless of what the model decides to do.
+</Warning>
+
+| Mechanism | What it enforces |
+|---|---|
+| `tool_names` allowlist | Which tools the child can call at all |
+| `write_globs` | Which paths any write tool may touch |
+| `required_tools` | Soft completeness signal — not a hard stop |
+| `system_prompt` | Model-level guidance — prompt only, not enforced |
+
+## Example A — read-only survey profile
+
+A personality that only needs to reason over text. No filesystem, no shell.
+
+```python title="agents/profiles/planner.py"
+from __future__ import annotations
+from agents.profile import AgentProfile
+
+PLANNER_SYSTEM = """\
+You are a planning-only agent. You do not read files, run commands, or edit
+anything. Given a task description and any facts already provided in the
+prompt, produce a short ordered plan (steps, owners, risks). If you need
+information you were not given, say so explicitly and stop — do not guess at
+file paths or code contents.\
+"""
+
+PROFILE = AgentProfile(
+    name="planner",
+    description=(
+        "Turns a fuzzy task into an ordered plan using only the text it was "
+        "given. Has no tools — cannot read the repo or verify anything. Use "
+        "only when the caller already has the facts and just wants them organized."
+    ),
+    system_prompt=PLANNER_SYSTEM,
+    tool_names=[],
+    write_globs=[],     # hard no-op: no writes possible
+    required_tools=[],
+    max_turns=4,
+    needs_worktree=False,
+)
+```
+
+Setting `tool_names=[]` and `write_globs=[]` means this personality is a hard no-op — even if a future edit accidentally adds a tool name, the write funnel blocks it.
+
+## Example B — restricted writer profile
+
+A writer that can only touch documentation files, enforced by `write_globs`:
+
+```python title="agents/profiles/docs.py"
+from __future__ import annotations
+from agents.profile import NAV, AgentProfile
+
+DOCS_SYSTEM = """\
+You write and update markdown documentation. You may read any file for context,
+but you may only create or edit files under docs/ or files ending in .md.
+Never touch application code.\
+"""
+
+PROFILE = AgentProfile(
+    name="docs",
+    description=(
+        "Write or update markdown docs. Cannot edit application code. "
+        "Use after ask has surveyed the relevant source."
+    ),
+    system_prompt=DOCS_SYSTEM,
+    tool_names=NAV + ["str_replace", "create_file"],
+    write_globs=["**/*.md", "docs/**"],   # enforced by the write funnel
+    required_tools=[],
+    max_turns=8,
+    needs_worktree=False,
+)
+```
+
+The `write_globs` list is what scopes this personality, not the system prompt. Even if `str_replace` is called against `agents/orchestrator.py`, the write funnel rejects it.
+
+## Example C — profile with a custom tool
+
+Sometimes the tools you need don't exist yet. This example adds a `todo_scanner` tool and an `auditor` profile that uses it.
+
+**Step 1 — framework-free logic:**
+
+```python title="runtime/tools/todos.py"
+from __future__ import annotations
+from pathlib import Path
+from runtime.tools.fileid import read_source
+
+MARKERS = ("TODO", "FIXME")
+
+def count_markers(workspace: Path, path: str) -> int:
+    src = read_source(workspace, path)
+    return sum(1 for line in src.text.splitlines() if any(m in line for m in MARKERS))
+```
+
+**Step 2 — thin LLM-facing wrapper:**
+
+```python title="tools/todos.py"
+from __future__ import annotations
+from tools.base import ToolContext, tool
+from runtime.tools.fileid import read_source
+from runtime.tools.todos import count_markers
+
+@tool(
+    description="Count TODO/FIXME markers in a workspace text file. Read-only.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Workspace-relative path to scan.",
+            },
+        },
+        "required": ["path"],
+    },
+)
+def todo_scanner(ctx: ToolContext, path: str) -> str:
+    src = read_source(ctx.workspace, path)
+    if ctx.files is not None:
+        ctx.files.mark(src.rel, src.raw_sha256)
+    return str(count_markers(ctx.workspace, path))
+```
+
+**Step 3 — profile that uses it by name:**
+
+```python title="agents/profiles/auditor.py"
+from __future__ import annotations
+from agents.profile import NAV, AgentProfile
+
+AUDITOR_SYSTEM = """\
+You scan the codebase for TODO/FIXME markers and report on technical debt.
+Use todo_scanner on files the caller names; use search first only if no
+paths were given.\
+"""
+
+PROFILE = AgentProfile(
+    name="auditor",
+    description="Scans named files for TODO/FIXME markers and reports counts.",
+    system_prompt=AUDITOR_SYSTEM,
+    tool_names=NAV + ["todo_scanner"],
+    write_globs=[],
+    required_tools=["todo_scanner"],   # incomplete if never called
+    max_turns=6,
+    needs_worktree=False,
+)
+```
+
+`discover_tools()` and `discover_profiles()` both run together in `runtime/session.py`'s `_bind_loop()`, so restarting the session picks up both the new tool and the new profile at the same time. No hand-wiring in either direction.
+
+**Step 4 — add tests:**
+
+```python title="tests/test_auditor.py"
+from tools.registry import discover_tools
+from agents.profile import discover_profiles
+
+def test_todo_scanner_discovered():
+    registry = discover_tools()
+    assert "todo_scanner" in registry._tools
+    assert not registry.errors
+
+def test_auditor_profile_discovered():
+    registry = discover_profiles()
+    assert "auditor" in registry.names()
+    assert not registry.errors
+```
+
+## Profile author checklist
+
+<Steps>
+  <Step title="Create agents/profiles/<name>.py">
+    Export `PROFILE = AgentProfile(...)` at module level. The file name and the `name` field don't need to match, but consistency helps.
+  </Step>
+  <Step title="Set tool_names as an allowlist">
+    Compose from the named constants (`NAV`, `SITTER`, `LSP`, `EDIT`, `SHELL`, etc.). Never include other profile names.
+  </Step>
+  <Step title="Set write_globs intentionally">
+    Read-only personalities: `write_globs=[]`. Writers confined to a subdirectory: explicit glob list. Unrestricted writers: `write_globs=None`.
+  </Step>
+  <Step title="Set needs_worktree for writers">
+    Any profile that edits application code and may run alongside another writer should set `needs_worktree=True` to avoid collisions.
+  </Step>
+  <Step title="Set join_worktree for reviewers">
+    Profiles that should see a writer's diff (e.g. a code reviewer) set `join_worktree=True` so they share the writer's branch.
+  </Step>
+  <Step title="Write a clear description">
+    The orchestrator picks profiles by description. Tell it when to use this personality and — equally important — when not to.
+  </Step>
+  <Step title="Add a test">
+    Call `discover_profiles()` and assert your profile's name is in `registry.names()` with no `registry.errors`. If it's a permanent builtin, add it to the name set in `tests/test_profiles.py::test_discover_builtin_profiles`.
+  </Step>
+</Steps>

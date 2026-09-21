@@ -1,0 +1,117 @@
+---
+title: "What is CodeLoom Engine?"
+sidebarTitle: "Introduction"
+description: "CodeLoom Engine: a headless agent backend where clients speak typed JSON over a Unix socket and never touch agent internals or the tool registry."
+---
+
+CodeLoom Engine is a long-lived Python process that binds to a single workspace and exposes a fully typed, newline-delimited JSON protocol over a Unix domain socket. Any client — a terminal UI, a web app, an editor plugin, or a test harness — can drive a powerful LLM coding agent without importing a single line of agent internals. The deliberate separation of concerns is the core design philosophy: clients speak JSON; they never touch the orchestrator, the tool registry, or the LLM client.
+
+## Why a hard boundary?
+
+Most agent frameworks fuse the model loop, tool implementations, and the user interface into one process. That makes the interesting parts — the tool layer that actually touches your code — hard to test and impossible to reuse independently.
+
+Engine separates those responsibilities into three layers:
+
+- **The core** (`EngineSession`) owns the workspace, the agent loop, the tool registry, and session state.
+- **The contract** (`protocol/`) is a set of JSON dataclasses. Commands flow in; events flow out. Nothing else crosses the socket boundary.
+- **The transport** (`EngineServer`) is NDJSON over a Unix domain socket today. The same message types would work over WebSocket or HTTP without touching the core.
+
+The payoff of this separation is a **paranoid write path**. Because every file edit is funneled through a single module (`runtime/tools/edits.py`) rather than scattered across tool implementations, every write automatically gets: a staleness check, a symlink and denylist guard, newline and encoding preservation, a tree-sitter syntax gate, an atomic replace, and a journal entry that makes the edit undoable. A tool author writes a pure `str → str` mutation function and inherits all of it for free.
+
+## Component stack
+
+The engine is composed of four layers that stack cleanly on top of one another:
+
+```
+Client(s) — NDJSON over AF_UNIX
+       │
+       ▼
+EngineServer          (runtime/server.py)
+  Unix socket · one per workspace
+  reads commands · fans out events to all subscribers
+       │
+       ▼
+EngineSession         (runtime/session.py)
+  state · subscribers · snapshots · LSP lifecycle
+  dispatches to HANDLERS[type(command)]
+       │
+       ├──────────────────────────────┐
+       ▼                              │
+runtime/commands/                     │ emits Events
+  lifecycle · files · git · agent     │
+       │                              │
+       ▼                              │
+Orchestrator          (agents/)       │──────────────┘
+  spawns named personalities          │
+  (ask · coder · tester · …)          │
+       │                              │
+       ├───────────────┐              │
+       ▼               ▼              │
+OpenRouterLLM     ToolRegistry        │
+                  (tools/)            │
+                       │              │
+                       ▼              │
+            runtime/tools/edits.py   │
+            stale check → guard       │
+            → syntax gate → atomic    │
+            write → journal           │
+                       │              │
+              ┌────────┴────────┐     │
+              ▼                 ▼     │
+           SQLite           LSPManager
+        .engine/          pyright · tsls
+        session.db        gopls
+```
+
+### EngineServer
+
+`EngineServer` (`runtime/server.py`) wraps `asyncio.start_unix_server` with an 8 MiB stream limit. Each connecting client receives two asyncio tasks — one reading NDJSON commands, one writing events from a per-client `asyncio.Queue`. Events fan out to every subscriber simultaneously, so multiple clients watching the same workspace all see the same stream. Unknown command types, non-object payloads, and malformed JSON are reported as `ErrorOccurred` events without dropping the connection.
+
+### EngineSession
+
+`EngineSession` (`runtime/session.py`) is the stateful core. It owns the `EngineConfig`, the `FileTracker`, the `PromptBroker`, the `LSPManager`, the `SkillCatalog`, and the in-memory `SessionState`. It dispatches every decoded command to a registered handler and emits typed events to all subscribers. Session state is persisted to SQLite after every user message, agent reply, file open/close, and on shutdown.
+
+### Orchestrator and subagent personalities
+
+The user talks only to the **Orchestrator** (`agents/orchestrator.py`), which is an `AgentLoop` with no filesystem tools — only one spawn tool per named personality: `ask`, `coder`, `tester`, `researcher`, `debugger`, and `reviewer`. Personalities are auto-discovered from `agents/profiles/` the same way tools are discovered from `tools/`.
+
+Spawns are fire-and-forget. The personality tool returns immediately with an `agent_id` (and `worktree`/`branch` for writers). The child runs in the background with its own history and an allow-listed tool set. When finished, its transcript is compressed into a structured result and posted back to the orchestrator as an `engine` chat line.
+
+### ToolRegistry and the write funnel
+
+`ToolRegistry` (`tools/registry.py`) auto-discovers all `@tool`-decorated functions from the `tools/` package. The registry caps tool results at 80,000 characters before they reach the model. Every write operation — regardless of which tool triggers it — goes through the single funnel in `runtime/tools/edits.py`, which enforces staleness checks, the write guard, the tree-sitter syntax gate, atomic writes, and edit journaling.
+
+## Concurrency model
+
+The server runs on a single `asyncio` event loop. Commands from any client mutate the one shared session. Blocking work is kept off the loop: language server requests run under `asyncio.to_thread`, and the LSP warm start happens on a daemon thread so a slow `pyright` boot never delays the first command.
+
+The write funnel's `_prepare`/`_commit`/`_apply_sync` path is deliberately synchronous and must stay that way — awaiting mid-write would open a read-modify-write race between the staleness check and the atomic replace.
+
+A child agent's own tools execute sequentially so read-before-write cannot race, even when multiple children run concurrently against the same workspace. Up to `max_spawns_per_turn` (default 8) children may be live at once.
+
+## Key capabilities
+
+<CardGroup cols={2}>
+  <Card title="64 built-in tools" icon="wrench">
+    Navigation, tree-sitter, LSP, editing, execution, git, GitHub, docs, HTTP, browser, and workspace memory — all auto-discovered, no registration list.
+  </Card>
+  <Card title="Named agent personalities" icon="users">
+    Six profiles (ask, coder, tester, researcher, debugger, reviewer) that share the tool layer. Writers run in isolated git worktrees so changes never collide with your working checkout.
+  </Card>
+  <Card title="Paranoid write funnel" icon="shield">
+    Every edit goes through one path: staleness check, write guard, syntax gate, atomic replace, and a journal entry with full before/after byte snapshots for exact undo.
+  </Card>
+  <Card title="Reconnect-safe protocol" icon="rotate">
+    `EngineSnapshot` carries the full reconnect payload. A generation counter prevents stale history replays from interleaving when a second snapshot is requested mid-stream.
+  </Card>
+  <Card title="Tree-sitter + LSP" icon="code">
+    Instant syntax queries and structural edits via tree-sitter; real cross-file type information and rename via pyright, tsls, and gopls. The syntax gate runs on every write.
+  </Card>
+  <Card title="Observable by design" icon="chart-line">
+    Prometheus metrics via Pushgateway, structured JSONL call traces with `ENGINE_TRACE_CALLS=1`, and per-turn token/cost stats surfaced as `StatsUpdated` events.
+  </Card>
+</CardGroup>
+
+## What's next
+
+Ready to run the engine for the first time? The [Quickstart guide](/quickstart) walks you from zero to your first agent response in a few minutes.

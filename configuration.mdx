@@ -1,0 +1,183 @@
+---
+title: "Configure CodeLoom Engine with Environment Variables"
+sidebarTitle: "Configuration"
+description: "Full reference for every EngineConfig environment variable: LLM settings, turn limits, exec approval mode, context budget, and Prometheus metrics."
+---
+
+All engine configuration is loaded once at startup by `EngineConfig.from_env()` in `runtime/config.py`. The method reads `env.sh` from the workspace root first, then reads real environment variables. **A value already exported in your shell always wins over `env.sh`** — the file never overwrites an existing variable.
+
+The recommended pattern is to keep a gitignored `env.sh` in your workspace root:
+
+```bash title="env.sh"
+export OPENROUTER_API_KEY="sk-or-v1-..."
+export OPENROUTER_MODEL="anthropic/claude-sonnet-5"
+
+# Optional tuning
+export ENGINE_MAX_TURNS=24
+export ENGINE_EXEC_APPROVAL=always
+export ENGINE_TRACE_CALLS=1
+```
+
+`env.sh` parsing handles `export`, `#` comments, and quoted values. The write guard refuses to let any agent write to this file, so your credentials are safe even when the agent has full write access to the workspace.
+
+<Note>
+  Without a valid `OPENROUTER_API_KEY` the engine still starts and serves file, snapshot, git, and undo commands. Only `SubmitUserMessage` fails, with a clear `set OPENROUTER_API_KEY` error.
+</Note>
+
+## LLM settings
+
+These variables control which model is used and how the HTTP connection to OpenRouter behaves.
+
+<ParamField path="OPENROUTER_API_KEY" type="string" required>
+  Your OpenRouter API key. Placeholder values — empty string, `...`, `your-key`, `changeme`, and `<OPENROUTER_API_KEY>` — are all treated as unset by the engine's key validation in `runtime/config.py` (`TYPESAFE_PLACEHOLDERS`).
+</ParamField>
+
+<ParamField path="OPENROUTER_MODEL" type="string" default="openai/gpt-4o-mini">
+  Any OpenRouter model slug with tool-calling support. Used for the orchestrator and all subagent profiles that do not declare their own `AgentProfile.model`. Example: `anthropic/claude-sonnet-5`.
+</ParamField>
+
+<ParamField path="OPENROUTER_CHILD_MODEL" type="string" default="(unset)">
+  Fallback model for subagent profiles that do not set `AgentProfile.model`. When unset, profiles inherit `OPENROUTER_MODEL`. The built-in `tester` profile overrides this with `anthropic/claude-haiku-4.5` regardless of this variable.
+</ParamField>
+
+<ParamField path="ENGINE_LLM_STREAM" type="boolean" default="1">
+  Set to `0` to disable token streaming. When streaming is enabled, each token arrives as a `ChatMessageDelta` event as soon as the model produces it. Accepted truthy values: `1`, `true`, `yes`, `on`. Accepted falsy values: `0`, `false`, `no`, `off`.
+</ParamField>
+
+<ParamField path="ENGINE_LLM_TIMEOUT_S" type="float" default="600.0">
+  Total HTTP request timeout in seconds for a single LLM call. Increase this for very long-running completions on large contexts.
+</ParamField>
+
+<ParamField path="ENGINE_LLM_IDLE_S" type="float" default="90.0">
+  Stream idle timeout in seconds. If no token arrives for this long during a streaming response, the request is treated as stalled and an error is raised.
+</ParamField>
+
+## Turn limits and continuation
+
+These variables control how many tool-calling turns agents are allowed and what happens when the cap is reached.
+
+<ParamField path="ENGINE_MAX_TURNS" type="integer" default="16">
+  Maximum tool-calling turns per orchestrator reply. Hitting the cap is a **checkpoint**, not a kill. The engine asks the user to **continue** (another `turn_slice` of turns), **handoff** (orchestrator may spawn one writer), or **stop**. Children use `AgentProfile.max_turns` (default 32) instead of this value.
+</ParamField>
+
+<ParamField path="ENGINE_TURN_SLICE" type="integer" default="16">
+  Number of additional turns granted on each **continue** answer when an agent hits its cap. At most `ENGINE_MAX_CONTINUES` continuation rounds are allowed.
+</ParamField>
+
+<ParamField path="ENGINE_MAX_CONTINUES" type="integer" default="3">
+  Maximum number of continuation rounds after the initial turn cap is reached. After this many continuations the agent is stopped regardless.
+</ParamField>
+
+<ParamField path="ENGINE_TURN_CONTINUE" type="string" default="prompt">
+  What to do when the orchestrator reaches its turn cap. Accepted values:
+
+  - `prompt` — ask the user to choose continue / handoff / stop (default).
+  - `never` — skip the prompt and hand off automatically to a writer subagent if there is leftover work; otherwise stop.
+
+  Any other value is rejected with a warning and falls back to `prompt`.
+</ParamField>
+
+<ParamField path="ENGINE_MAX_SPAWNS_PER_TURN" type="integer" default="8">
+  Maximum number of live concurrent subagents. This is not reset per orchestrator reply — it is a global cap on the total number of children alive at any moment.
+</ParamField>
+
+## Shell execution approval
+
+<ParamField path="ENGINE_EXEC_APPROVAL" type="string" default="auto">
+  Controls when the `run_command` tool prompts the user before executing a shell command. Accepted values:
+
+  - `auto` — approve read-only-looking commands silently; prompt for write-looking ones.
+  - `always` — prompt before every `run_command` call.
+  - `never` — never prompt; execute all commands automatically.
+
+  Any other value is rejected with a warning and falls back to `auto`.
+</ParamField>
+
+<ParamField path="ENGINE_EXEC_TIMEOUT_S" type="integer" default="120">
+  Default timeout in seconds for `run_command`. Individual tool calls can request a shorter timeout, but never longer than 600 seconds (enforced in `runtime/tools/shell.py`).
+</ParamField>
+
+<ParamField path="ENGINE_EXEC_FILE_LIMIT_MB" type="integer" default="2048">
+  `ulimit -f` cap applied to subprocesses spawned by `run_command`, expressed in POSIX 512-byte blocks. Prevents a runaway command from filling the disk.
+</ParamField>
+
+## Context budget and compaction
+
+<ParamField path="ENGINE_CONTEXT_BUDGET" type="integer" default="120000">
+  Token budget that triggers context compaction. When the estimated context size reaches `compact_trigger × context_budget` (default 0.7 × 120,000 = 84,000 tokens), the engine summarizes the oldest tool messages to bring the context back under budget. A `ContextCompacted` event is emitted with the strategy used and the number of chars saved.
+
+  Children use a fixed `compact_trigger` of `2.0`, which effectively disables in-loop compaction for subagents. They are compacted via `compress_for_parent` when they finish.
+</ParamField>
+
+## Subscriber capacity
+
+These variables set the per-client event queue limits. You should rarely need to change them.
+
+<ParamField path="ENGINE_SUBSCRIBER_CAPACITY" type="integer" default="4096">
+  Maximum number of events that can be buffered in a single client's outbound queue before delta-drop policy activates. When the queue is full, `ChatMessageDelta` events are silently dropped; all other event types still block.
+</ParamField>
+
+<ParamField path="ENGINE_SUBSCRIBER_BYTES" type="integer" default="1048576">
+  Maximum total bytes buffered in a single client's outbound queue (`1 << 20` = 1 MiB). When this limit is exceeded the delta-drop policy also activates.
+</ParamField>
+
+## Metrics and observability
+
+<ParamField path="ENGINE_PUSHGATEWAY_URL" type="string" default="(unset)">
+  Base URL of a Prometheus Pushgateway instance, for example `http://localhost:9091`. When unset, no pushes are made but metrics still accumulate in-process and can be read programmatically. Set this to enable push-based scraping in CI or long-running sessions.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_JOB" type="string" default="engine">
+  Pushgateway job name used as the grouping key when pushing metrics. Defaults to `engine` if the value is empty after stripping whitespace.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_INSTANCE" type="string" default="(session id)">
+  Pushgateway grouping key `instance`. Defaults to the active session UUID. Set this to a stable name (e.g. `baseline`) when comparing runs in a benchmark or A/B test.
+</ParamField>
+
+<ParamField path="ENGINE_METRICS_PUSH_INTERVAL_S" type="float" default="2.0">
+  Debounce interval in seconds between Pushgateway pushes during an active session. Turn end, agent finish, and session close always flush immediately regardless of this value. Negative values are rejected with a warning and fall back to `2.0`.
+</ParamField>
+
+<ParamField path="ENGINE_TRACE_CALLS" type="boolean" default="0">
+  When set to `1`, the engine writes a structured JSONL trace of every tool call to `.engine/trace.jsonl` in the workspace. Each line records the call ID, tool name, agent ID and profile, arguments, result, `ok` flag, duration in milliseconds, and any model reasoning text.
+
+  Use this for debugging — it lets you replay exactly what the agent did and why.
+</ParamField>
+
+## Quick-reference table
+
+| Variable | Default | Group |
+|---|---|---|
+| `OPENROUTER_API_KEY` | — | LLM |
+| `OPENROUTER_MODEL` | `openai/gpt-4o-mini` | LLM |
+| `OPENROUTER_CHILD_MODEL` | (unset) | LLM |
+| `ENGINE_LLM_STREAM` | `1` | LLM |
+| `ENGINE_LLM_TIMEOUT_S` | `600.0` | LLM |
+| `ENGINE_LLM_IDLE_S` | `90.0` | LLM |
+| `ENGINE_MAX_TURNS` | `16` | Turns |
+| `ENGINE_TURN_SLICE` | `16` | Turns |
+| `ENGINE_MAX_CONTINUES` | `3` | Turns |
+| `ENGINE_TURN_CONTINUE` | `prompt` | Turns |
+| `ENGINE_MAX_SPAWNS_PER_TURN` | `8` | Turns |
+| `ENGINE_EXEC_APPROVAL` | `auto` | Execution |
+| `ENGINE_EXEC_TIMEOUT_S` | `120` | Execution |
+| `ENGINE_EXEC_FILE_LIMIT_MB` | `2048` | Execution |
+| `ENGINE_CONTEXT_BUDGET` | `120000` | Context |
+| `ENGINE_SUBSCRIBER_CAPACITY` | `4096` | Subscriber |
+| `ENGINE_SUBSCRIBER_BYTES` | `1048576` | Subscriber |
+| `ENGINE_PUSHGATEWAY_URL` | (unset) | Metrics |
+| `ENGINE_METRICS_JOB` | `engine` | Metrics |
+| `ENGINE_METRICS_INSTANCE` | (session id) | Metrics |
+| `ENGINE_METRICS_PUSH_INTERVAL_S` | `2.0` | Metrics |
+| `ENGINE_TRACE_CALLS` | `0` | Debug |
+
+## Validation and warnings
+
+Malformed values do not crash the engine. `EngineConfig.from_env()` collects parse failures and invalid enum choices into a `warnings` list, which is emitted as `WarningOccurred` events to all connected clients at session bind time. For example, setting `ENGINE_EXEC_APPROVAL=banana` produces:
+
+```
+warning: ENGINE_EXEC_APPROVAL='banana' is not auto|always|never; using auto
+```
+
+This means misconfigured deployments surface problems visibly in the client rather than silently using wrong values.

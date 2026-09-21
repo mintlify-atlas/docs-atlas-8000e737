@@ -1,0 +1,168 @@
+---
+title: "Subagent Personalities: Specialized AI Roles"
+sidebarTitle: "Overview"
+description: "How the orchestrator discovers named profiles, spawns them as tools, enforces write boundaries, routes worktree isolation, and compacts each child's result into an AgentResult."
+---
+
+CodeLoom Engine decomposes every user request into focused, single-purpose agents called **personalities**. Rather than one monolithic agent that reads, writes, tests, and searches, the orchestrator selects the right personality for each job and fires it as an async tool call — keeping each child sandboxed by its capabilities and its write boundaries. This page describes the full personality system: how profiles are discovered, how they become spawn tools, what constraints each type enforces, and what comes back when they finish.
+
+## ProfileRegistry and discover\_profiles
+
+Every personality is an `AgentProfile` dataclass registered in a `ProfileRegistry`. At startup, `discover_profiles()` walks the `agents/profiles/` package with `pkgutil.walk_packages`, imports every non-underscore module, and registers any module-level `PROFILE` attribute that is an `AgentProfile` instance.
+
+```python title="agents/profile.py"
+@dataclass
+class AgentProfile:
+    name: str
+    description: str
+    system_prompt: str
+    tool_names: list[str]
+    write_globs: list[str] | None = None   # None = unrestricted, [] = read-only
+    required_tools: list[str] = field(default_factory=list)
+    max_turns: int = 32
+    model: str | None = None               # overrides the session model when set
+    temperature: float = 0.2
+    needs_worktree: bool = False           # create an isolated git worktree
+    join_worktree: bool = False            # join the latest writer's worktree
+```
+
+`discover_profiles()` returns a populated `ProfileRegistry`. The registry exposes `get(name)`, `list()`, `names()`, and `as_tools(spawn)` — the last one converts every registered profile into a `Tool` that the orchestrator calls by name.
+
+## Profiles as spawn tools
+
+`ProfileRegistry.as_tools(spawn)` creates one `Tool` per profile. Each tool's `execute` function simply calls `spawn(name, task, continue_from=continue_from)`. The orchestrator registers all of them at init time, so calling `coder(task="…")` in an LLM tool-call is the same as calling `spawn("coder", "…")` in Python.
+
+```python title="agents/profile.py (simplified)"
+def _spawn_tool(profile: AgentProfile, spawn: SpawnFn) -> Tool:
+    async def execute(ctx, task: str, continue_from: str = "") -> str:
+        return await spawn(profile.name, task, continue_from=continue_from)
+    # ...
+    return Tool(name=profile.name, description=profile.description, ...)
+```
+
+Writer profiles (`needs_worktree=True`) expose a `continue_from` parameter. Passing a previous writer's `agent_id` there routes the new agent into that existing worktree instead of branching off HEAD into a fresh one.
+
+## Tool allowlists per profile
+
+Each profile declares exactly which tools it may call via `tool_names`. The orchestrator builds the child's `ToolRegistry` from `all_tools.subset(profile.tool_names)` — unrecognised names are silently dropped. The predefined group constants in `profile.py` combine into each profile's allowlist:
+
+| Constant | Tools included |
+|---|---|
+| `NAV` | `list_files`, `read_file`, `search` |
+| `SITTER` | `list_symbols`, `find_symbol`, `get_node_at`, `query_tree`, `parse_file` |
+| `LSP` | `goto_definition`, `find_references`, `hover`, `get_diagnostics`, `document_symbols` |
+| `EDIT` | `str_replace`, `replace_lines`, `insert_at_line`, `create_file`, `replace_symbol`, `insert_after_imports`, `apply_patch`, `rename_symbol`, `undo_edit`, `list_edits` |
+| `GIT` | `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_range` |
+| `SHELL` | `run_command` |
+| `WEB` | `web_search`, `web_fetch` |
+| `BROWSER` | `browser_open`, `browser_console`, `browser_screenshot`, `browser_network` |
+| `GH_READ` | All `GH_SOCIAL` + `GH_REPO` tools (PR/issue/run/release read + repo/tree/file/compare/search) |
+| `GH_WRITE` | `gh_pr_comment`, `gh_issue_create` |
+| `HTTP` | `http_request`, `openapi_ops` |
+| `ENV` | `runtime_info` |
+| `SCAN` | `todo_scan` |
+| `DEP` | `dep_why` |
+| `PKG` | `pkg_info` |
+| `DOCS` | `docs_lookup`, `tldr` |
+| `SEC` | `osv_query` |
+| `SKILLS` | `activate_skill`, `read_skill` |
+| `MEMORY` | `remember` |
+| `MCP` | `mcp` |
+
+## write\_globs enforcement
+
+The `write_globs` field restricts which paths a profile may write to:
+
+- **`None`** — no restriction; the profile may write any file (coder).
+- **`[]`** (empty list) — read-only; all writes are rejected (ask, researcher, reviewer, debugger).
+- **A non-empty list** — writes are allowed only to paths that match one of the provided glob patterns (tester uses `TEST_GLOBS`).
+
+This is enforced at the `Subagent` level: the profile's `write_globs` value is passed directly into the agent loop as `write_globs`.
+
+## Worktree isolation
+
+Two profile flags control git worktree routing:
+
+<AccordionGroup>
+  <Accordion title="needs_worktree=True — create an isolated worktree">
+    When `needs_worktree=True`, the orchestrator calls `add_agent_worktree(workspace, agent_id, profile.name)` before spawning the child. This creates a linked git checkout at `.engine/worktrees/<agent_id>/` on a new branch named `engine/<profile>/<agent_id>`. The child operates entirely inside that directory — it cannot touch the user's main checkout. Writers (coder and tester) set this flag.
+  </Accordion>
+  <Accordion title="join_worktree=True — join an existing writer's worktree">
+    When `join_worktree=True`, the orchestrator locates the most recent open writer worktree in the same batch and points the new child there. The child sees the writer's uncommitted diff. It cannot create its own worktree. Reviewer sets this flag so it reviews what the writer actually changed.
+  </Accordion>
+</AccordionGroup>
+
+After a writer finishes, the orchestrator asks the user to **merge**, **open a PR**, **keep**, or **discard** the worktree. The `settle_worktree` tool (also registered on the orchestrator) drives this flow by calling `apply_worktree()` in `runtime/tools/git.py`.
+
+## Spawn budget (max\_spawns\_per\_turn)
+
+The orchestrator tracks live children with `_live_spawn_count()`. When that count reaches `spawn_budget` (default `8`), `spawn()` returns `"error: spawn budget exhausted"` and no new child is started. The budget resets with `reset_spawn_budget()`.
+
+Survey-once profiles (`ask` and `researcher`) are additionally limited to one spawn per user message. A second attempt on the same turn returns `"error: already spawned … this user message; answer with what you have or ask the user"`. An `incomplete` status on those profiles arms a single retry, tracked via `_survey_retry`.
+
+## REPORT\_TO\_ORCH and the briefing format
+
+Every subagent's system prompt is suffixed with `REPORT_TO_ORCH`:
+
+```python title="agents/profile.py"
+REPORT_TO_ORCH = (
+    "Your only reader is the orchestrator, not a human. "
+    "Do not greet, apologize, or recap the task. No markdown headings or filler. "
+    "End with a complete briefing: labeled lines for what / paths / facts / verdict / leftover. "
+    "Facts must be specific enough that a later coder can work without re-surveying. "
+    "A filename is not an answer. Finish the investigation before you report. "
+    "Omit empty fields. If a command or fetch failed for environment reasons "
+    "(missing dependency, auth, network) rather than a code bug, say so in "
+    "leftover instead of retrying blindly."
+)
+```
+
+The expected briefing labels are:
+
+| Label | Content |
+|---|---|
+| `what` | What the agent did or found |
+| `paths` | All relevant file paths |
+| `facts` | Specific findings: signatures, versions, URLs, error text |
+| `verdict` | Approve / reject / adopt / skip / complete / incomplete |
+| `leftover` | Unresolved questions or blockers — not retried, passed up to the orchestrator |
+
+## AgentResult dataclass
+
+When a child finishes, `Subagent.finish()` calls `compress_for_parent()` which distils the full conversation history into an `AgentResult`:
+
+```python title="agents/compactor.py"
+@dataclass
+class AgentResult:
+    status: str                        # ok | incomplete | max_turns | stopped | aborted | failed
+    summary: str = ""                  # ≤400-char clip of the briefing
+    outcome: str = ""                  # full last assistant text (≤32 000 chars)
+    files_touched: list[str] = field(default_factory=list)
+    leftover_questions: list[str] = field(default_factory=list)
+    missing_checks: list[str] = field(default_factory=list)
+```
+
+`missing_checks` is populated when `required_tools` lists a tool name that never appeared in the child's tool calls — in that case `status` is set to `"incomplete"` automatically, regardless of what the child reported.
+
+## Built-in profiles
+
+<CardGroup cols={3}>
+  <Card title="ask" icon="magnifying-glass" href="/agents/ask">
+    Read-only codebase survey and Q&A. Uses NAV + SITTER + LSP + SCAN + SKILLS + MEMORY. No writes, no shell, no web.
+  </Card>
+  <Card title="coder" icon="code" href="/agents/coder">
+    Implement code changes in an isolated git worktree. Full EDIT + SHELL access. Must call `get_diagnostics` before finishing.
+  </Card>
+  <Card title="tester" icon="flask" href="/agents/tester">
+    Write and run tests in an isolated worktree. Restricted to `TEST_GLOBS` paths. Must call `run_command` at least once.
+  </Card>
+  <Card title="researcher" icon="globe" href="/agents/researcher">
+    Investigate external libraries, APIs, and GitHub repos. WEB + GH_REPO + PKG + DOCS. No workspace edits.
+  </Card>
+  <Card title="debugger" icon="bug" href="/agents/debugger">
+    Find bugs using LSP, shell, git history, and a headless browser. Read-only. Returns a structured bug report.
+  </Card>
+  <Card title="reviewer" icon="check-circle" href="/agents/reviewer">
+    Review a writer's git diff. Joins the writer's worktree. Returns approve / request changes / block verdict.
+  </Card>
+</CardGroup>

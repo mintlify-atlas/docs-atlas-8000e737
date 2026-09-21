@@ -1,0 +1,140 @@
+{
+  "projectType": "ai-ml",
+  "projectName": "CodeLoom Engine",
+  "projectDescription": "A headless AI coding agent backend that exposes a newline-delimited JSON protocol over a Unix domain socket, enabling any client to drive a multi-personality LLM orchestrator with 64 tools for reading, searching, and editing code.",
+  "theme": "luma",
+  "primaryColor": "#f59e0b",
+  "lightColor": "#cf4d2d",
+  "darkColor": "#662c20",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "configuration"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/agent-loop",
+              "architecture/write-funnel",
+              "architecture/persistence"
+            ]
+          },
+          {
+            "group": "Agent Personalities",
+            "pages": [
+              "agents/overview",
+              "agents/ask",
+              "agents/coder",
+              "agents/tester",
+              "agents/researcher",
+              "agents/debugger",
+              "agents/reviewer"
+            ]
+          },
+          {
+            "group": "Integrations",
+            "pages": [
+              "integrations/mcp-servers",
+              "integrations/skills",
+              "integrations/language-support"
+            ]
+          },
+          {
+            "group": "Extending",
+            "pages": [
+              "extending/adding-a-tool",
+              "extending/adding-a-profile",
+              "extending/adding-a-skill",
+              "extending/adding-a-command"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Protocol Reference",
+        "groups": [
+          {
+            "group": "Wire Protocol",
+            "pages": [
+              "protocol/overview",
+              "protocol/commands",
+              "protocol/events",
+              "protocol/snapshot"
+            ]
+          },
+          {
+            "group": "Tool Reference",
+            "pages": [
+              "tools/navigation",
+              "tools/editing",
+              "tools/tree-sitter",
+              "tools/lsp",
+              "tools/shell-git",
+              "tools/web-http",
+              "tools/github",
+              "tools/memory-skills"
+            ]
+          },
+          {
+            "group": "Operations",
+            "pages": [
+              "operations/metrics",
+              "operations/benchmarking",
+              "operations/troubleshooting"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Headless AI coding agent backend with NDJSON-over-Unix-socket protocol",
+    "Multi-personality orchestrator with 6 built-in subagent profiles (ask, coder, tester, researcher, debugger, reviewer)",
+    "64 tools spanning file navigation, tree-sitter AST queries, LSP integration, shell execution, git, GitHub, web, and MCP",
+    "Paranoid write funnel with read-before-edit enforcement, path guard, syntax gate (tree-sitter), atomic writes, and journal-based undo",
+    "Context compaction with cascading trim/summarize/truncate/drop strategy to stay within LLM context budgets",
+    "Git worktree isolation for writer agents with merge/PR/keep/discard settle flow",
+    "Structured long-term memory (files, engineering, product, CI/CD, other) persisted to .engine/memory.json",
+    "MCP server integration with auth flow, backoff/reconnect, and profile-scoped tool allowlists",
+    "Skills system with SKILL.md discovery, progressive disclosure, and lexical ranking",
+    "Prometheus metrics with Pushgateway support and A/B benchmark harness"
+  ],
+  "publicApiSurface": [
+    "StartSession command",
+    "SubmitUserMessage command",
+    "RequestSnapshot command",
+    "AbortAgent command",
+    "AnswerPrompt command",
+    "UndoLastEdit command",
+    "CreatePath / RenamePath / DeletePath commands",
+    "SetMcpEnabled / ReloadIntegrations commands",
+    "ActivateSkill command",
+    "RequestContext / RequestMemory / RequestAgentTranscript commands",
+    "SnapshotReady event",
+    "ChatMessageAdded / ChatMessageDelta events",
+    "ToolCallStarted / ToolCallFinished events",
+    "AgentStarted / AgentFinished / AgentsUpdated events",
+    "FileEdited / FileContent / FileTreeUpdated events",
+    "GitStateUpdated event",
+    "UserPromptRequested event",
+    "WorktreeSettled event",
+    "StatsUpdated event",
+    "MemoryUpdated / SkillCatalogUpdated / McpServersUpdated events",
+    "EngineSnapshot dataclass",
+    "AgentProfile / ProfileRegistry",
+    "ToolContext / Tool / @tool decorator",
+    "ToolRegistry / discover_tools()",
+    "OpenRouterLLM.complete()",
+    "EngineConfig.from_env()",
+    "app.py CLI (workspace argument)"
+  ]
+}

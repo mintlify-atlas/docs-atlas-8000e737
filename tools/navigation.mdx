@@ -1,0 +1,235 @@
+---
+title: "Navigation Tools: Read Files and List the Workspace"
+sidebarTitle: "Navigation"
+description: "Explore any workspace with list_files, read_file, and search — paginate source with numbered line windows, ripgrep patterns, and glob filters."
+---
+
+Every agent turn begins with orientation. Before touching code, agents use the navigation tools to discover what files exist, page through their contents, and locate patterns across the workspace. These three tools form the foundation of every read path in CodeLoom Engine.
+
+<CardGroup cols={3}>
+  <Card title="list_files" icon="folder-tree">
+    Enumerate all source files as relative paths, skipping caches and vendor dirs.
+  </Card>
+  <Card title="read_file" icon="file-lines">
+    Read any UTF-8 file as a numbered line window with `offset` + `limit` pagination.
+  </Card>
+  <Card title="search" icon="magnifying-glass">
+    Full-text ripgrep across the workspace with optional path and glob filters.
+  </Card>
+</CardGroup>
+
+---
+
+## `list_files`
+
+```python
+list_files(ctx: ToolContext) -> str
+```
+
+Recursively walks the workspace and returns every source file as a newline-separated list of relative POSIX paths. Directories are not listed — only leaf files are emitted. The traversal is alphabetically sorted with directories before files at each level.
+
+### Skipped directories
+
+The following names are never descended into, regardless of depth:
+
+`.git`, `.engine`, `.cursor`, `__pycache__`, `node_modules`, `.venv`, `venv`, `.ruff_cache`, `ruff_cache`, `.mypy_cache`, `.pytest_cache`, `.hypothesis`, `.tox`, `.nox`, `.cache`, `.eggs`, `.ipynb_checkpoints`, `.parcel-cache`, `.next`, `.nuxt`, `.turbo`, `.nyc_output`, `htmlcov`, `coverage`, `site-packages`, `dist`, `build`
+
+Any directory whose name ends with `.egg-info` or `.dist-info`, or whose name starts with `.` and contains `cache` (case-insensitive), is also skipped.
+
+### Parameters
+
+<ParamField path="ctx" type="ToolContext" required>
+  Injected tool context — carries the workspace root path.
+</ParamField>
+
+### Return value
+
+A newline-separated string of relative paths, e.g.:
+
+```
+src/main.py
+src/models/user.py
+tests/test_main.py
+```
+
+Returns the literal string `(empty)` when no files are found.
+
+### Usage notes
+
+- Call `list_files` first when you have no prior knowledge of the workspace layout.
+- The result can be long for large repos. Feed it to `search` or `read_file` rather than reading every file.
+- If the workspace is empty or fully filtered, the result is `(empty)`.
+
+<Tip>
+Use `list_files` once per conversation turn, not in a loop. The tree is stable within a turn unless an edit tool runs.
+</Tip>
+
+### Example
+
+```python
+# Agent tool call
+list_files(ctx)
+
+# Example output
+agents/__init__.py
+agents/loop.py
+agents/orchestrator.py
+protocol/codec.py
+protocol/commands.py
+runtime/config.py
+runtime/session.py
+tools/list_files.py
+tools/read_file.py
+```
+
+---
+
+## `read_file`
+
+```python
+read_file(ctx: ToolContext, path: str, offset: int = 1, limit: int = 200) -> str
+```
+
+Reads a UTF-8 text file and returns a window of numbered lines. Every line is prefixed with its 1-based line number padded to the width of the total line count, separated by a `|` character. The header on the first output line reports the filename, the displayed range, the total line count, and the `next offset` value to use for pagination.
+
+The tool also records the file's SHA-256 hash in the session's `FileTracker`, which the editing tools later use to detect concurrent modifications.
+
+### Parameters
+
+<ParamField path="ctx" type="ToolContext" required>
+  Injected tool context.
+</ParamField>
+
+<ParamField path="path" type="str" required>
+  Path relative to the workspace root. Must stay inside the workspace.
+</ParamField>
+
+<ParamField path="offset" type="int" default="1">
+  1-based line number to start reading from. Pass `next offset` from the header to page forward.
+</ParamField>
+
+<ParamField path="limit" type="int" default="200">
+  Number of lines to return. Clamped to the range `[1, 400]`. Values outside this range are silently clamped.
+</ParamField>
+
+### Return value
+
+```
+src/main.py  lines 1-200 of 450  (next offset=201)
+  1|import sys
+  2|from runtime.session import EngineSession
+  3|
+  ...
+200|    session.run()
+```
+
+When `offset` is past the end of the file:
+
+```
+src/main.py  offset 500 is past end (450 lines)
+```
+
+### Pagination
+
+Read the `next offset=N` annotation in the header and pass `offset=N` on the next call. Omit `limit` to use the 200-line default, or increase it up to `400` if context permits.
+
+<Note>
+Always read a file before editing it. Editing tools check the `FileTracker` hash and reject edits on files that have changed since the last read.
+</Note>
+
+### Constants (from `runtime/tools/fs.py`)
+
+| Constant | Value |
+|---|---|
+| `DEFAULT_READ_LIMIT` | `200` |
+| `MAX_READ_LIMIT` | `400` |
+
+### Example
+
+```python
+# First page
+read_file(ctx, "runtime/config.py")
+# Output header: runtime/config.py  lines 1-200 of 312  (next offset=201)
+
+# Second page
+read_file(ctx, "runtime/config.py", offset=201)
+# Output header: runtime/config.py  lines 201-312 of 312
+```
+
+---
+
+## `search`
+
+```python
+search(ctx: ToolContext, pattern: str, path: str = "", glob: str = "", max_matches: int = 80) -> str
+```
+
+Runs [ripgrep](https://github.com/BurntSushi/ripgrep) against the workspace and returns matches as `relative/path:line_number:matched_text` lines. The same directory skip-list used by `list_files` is applied via ripgrep `--glob` exclusions, so caches, venvs, and vendor dirs are never searched.
+
+### Parameters
+
+<ParamField path="ctx" type="ToolContext" required>
+  Injected tool context.
+</ParamField>
+
+<ParamField path="pattern" type="str" required>
+  A ripgrep-compatible regular expression. Ripgrep treats this as a Rust regex, so use `\\b` for word boundaries, `(?i)` for case-insensitive, etc.
+</ParamField>
+
+<ParamField path="path" type="str" default='""'>
+  Optional workspace-relative file or directory to restrict the search scope. When empty, the entire workspace is searched.
+</ParamField>
+
+<ParamField path="glob" type="str" default='""'>
+  Optional ripgrep glob pattern passed as `--glob`, e.g. `*.py`, `*.{ts,tsx}`. Applied after the built-in skip-list.
+</ParamField>
+
+<ParamField path="max_matches" type="int" default="80">
+  Maximum number of result lines to return. Clamped to `[1, 200]`. When the actual match count exceeds the limit, the output ends with `... (N more matches; raise max_matches)`.
+</ParamField>
+
+### Return value
+
+```
+agents/loop.py:42:    def _dispatch(self, cmd: Command) -> None:
+agents/orchestrator.py:18:class Orchestrator:
+runtime/session.py:91:        def _dispatch(self, ...
+```
+
+Returns `(no matches)` when ripgrep exits with code 1 (no results). Raises `RuntimeError` if `rg` is not installed.
+
+### Constants (from `runtime/tools/search.py`)
+
+| Constant | Value |
+|---|---|
+| `DEFAULT_MAX_MATCHES` | `80` |
+| `MAX_MATCHES` | `200` |
+
+Line content is capped at 200 characters per match by ripgrep's `--max-columns 200` flag.
+
+### Usage notes
+
+- **Prefer `search` over guessing filenames.** If you need to find where a function is defined, search for it rather than reading every file in `list_files` output.
+- Use `path` to narrow scope when you know the subsystem (e.g. `path="runtime"` to search only the runtime package).
+- Use `glob` to restrict by file type: `glob="*.go"` or `glob="*.{ts,tsx}"`.
+- Raise `max_matches` only if the truncation message appears and you need the full result set.
+
+<Tip>
+Combine `path` and `glob` together. For example, `path="src", glob="*.py"` searches only Python files inside `src/`.
+</Tip>
+
+### Examples
+
+```python
+# Find all usages of EngineConfig across the workspace
+search(ctx, r"EngineConfig")
+
+# Find class definitions in the agents directory
+search(ctx, r"^class\s+\w+", path="agents")
+
+# Find TypeScript imports for a specific module
+search(ctx, r'from ["\']./codec["\']', glob="*.ts")
+
+# Find TODO comments with more results than the default cap
+search(ctx, r"TODO|FIXME", max_matches=150)
+```

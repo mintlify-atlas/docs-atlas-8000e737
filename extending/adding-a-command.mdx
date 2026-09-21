@@ -1,0 +1,271 @@
+---
+title: "Extend the Protocol with a Custom Command"
+sidebarTitle: "Adding a Command"
+description: "Follow the four-step process to add a new client-to-engine protocol command: define a dataclass, write a handler, register the module, and add round-trip tests."
+---
+
+Commands are the client-to-engine half of CodeLoom's Unix-socket protocol. Every message the client sends — `StartSession`, `SubmitUserMessage`, `OpenFile`, and so on — is a command. The server-to-client half (events) follows the same decorator pattern in `protocol/events.py`.
+
+Like tools and profiles, commands are discovered by decorator-based registries — there is no central dispatch chain to extend. Adding a command takes four steps: define a dataclass, write a handler, (if creating a new module) import it, and add tests.
+
+## The four pieces
+
+<CardGroup cols={2}>
+  <Card title="protocol/commands.py" icon="code">
+    One `@command @dataclass` class per command. The `@command` decorator registers the class in `COMMANDS` by class name so the codec can route incoming `{"type": ...}` JSON objects.
+  </Card>
+  <Card title="protocol/codec.py" icon="arrows-left-right">
+    `encode` / `decode_command` / `decode_event`. NDJSON: one JSON object per line, always with a `"type"` field. No changes needed here — auto-registered via `COMMANDS`.
+  </Card>
+  <Card title="runtime/commands/<module>.py" icon="bolt">
+    Handler implementation decorated with `@handles(CommandType)`. Add to an existing module if your command fits, or create a new one.
+  </Card>
+  <Card title="runtime/commands/__init__.py" icon="plug">
+    Imports every handler module for its side effects. **This is the one manual step** — if you add a new module, import it here so `@handles` decorators run and populate `HANDLERS`.
+  </Card>
+</CardGroup>
+
+## Minimal complete example
+
+Here is the full lifecycle of a new `RenameSession` command from protocol definition to handler.
+
+**Step 1 — define the dataclass in `protocol/commands.py`:**
+
+```python title="protocol/commands.py"
+from protocol.message import ProtocolMessage
+from dataclasses import dataclass
+
+@command
+@dataclass
+class RenameSession(ProtocolMessage):
+    name: str
+```
+
+The `@command` decorator registers the class in `COMMANDS` by `cls.__name__`. Order matters: `@command` is the outer decorator (applied last), `@dataclass` is the inner (applied first). `@command` reads `cls.__name__` after the dataclass is fully built.
+
+**Step 2 — write the handler:**
+
+```python title="runtime/commands/lifecycle.py"
+from protocol.commands import RenameSession
+from protocol.events import ErrorOccurred
+from runtime.commands.register import handles
+
+
+@handles(RenameSession)
+def rename_session(session, command: RenameSession) -> None:
+    if not session._require_session():
+        return
+    if not command.name.strip():
+        session._emit(ErrorOccurred(message="name must not be empty"))
+        return
+    session._state.name = command.name.strip()
+    session._persist()
+```
+
+**Step 3 — if it's a new module, import it in `runtime/commands/__init__.py`:**
+
+```python title="runtime/commands/__init__.py"
+from runtime.commands import lifecycle      as _lifecycle      # noqa: F401
+from runtime.commands import my_new_module  as _my_new_module  # noqa: F401
+```
+
+Without this import the `@handles` decorator never runs and `HANDLERS` won't contain your command. `session.handle()` will emit `"unknown command: YourCommand"` even though the dataclass decodes correctly.
+
+**Step 4 — add a codec round-trip test:**
+
+```python title="tests/test_protocol.py"
+from protocol.commands import RenameSession
+from protocol.codec import decode_command, encode
+
+def test_rename_session_round_trip():
+    parsed = decode_command(encode(RenameSession(name="foo")))
+    assert isinstance(parsed, RenameSession)
+    assert parsed.name == "foo"
+```
+
+That's the entire integration. The codec routes by `type` field, `EngineSession.handle` dispatches via `HANDLERS[type(command)]`.
+
+## Defining the command dataclass
+
+Inherit `ProtocolMessage` and let its `to_json`/`from_json` handle serialization automatically based on dataclass fields and type hints.
+
+```python title="protocol/commands.py (pattern)"
+@command
+@dataclass
+class MyCommand(ProtocolMessage):
+    path: str              # required — no default
+    offset: int | None = None   # optional — omitted from JSON when None
+    flags: list[str] = field(default_factory=list)
+```
+
+Field type rules for round-trip serde:
+
+<Accordion title="Plain scalars — str, int, float, bool, list[str]">
+  Round-trip as-is. No special handling needed.
+</Accordion>
+
+<Accordion title="Optional fields — X | None">
+  `to_json` skips `None` values entirely (the field is absent from the wire object). `from_json` decodes a missing key or an empty string back to `None`. Use `X | None` — never `Optional[X]` — for consistency with the rest of the protocol module.
+</Accordion>
+
+<Accordion title="Nested ProtocolMessage">
+  A field typed as another `ProtocolMessage` subclass (or `list[SomeMessage]`) is recursively encoded/decoded via that class's own `to_json`/`from_json`. See `SnapshotReady.snapshot: EngineSnapshot` or `AnswerPrompt`/`UserPromptRequested` for precedent.
+</Accordion>
+
+<Accordion title="Zero-field commands">
+  Even commands with no data are real dataclasses with `pass`:
+
+  ```python
+  @command
+  @dataclass
+  class RequestOrchContext(ProtocolMessage):
+      pass
+  ```
+
+  Keep `pass` — the type must still exist for lookup, round-trip, and handler dispatch.
+</Accordion>
+
+<Warning>
+  The class name **is** the wire `"type"` value and the registry key. Renaming a shipped command is a breaking change to the client/server contract. Don't do it lightly — `dummy_client.py` and any real client match on these exact strings.
+</Warning>
+
+## Writing the handler
+
+Handler signature:
+
+```python
+def handler(session: EngineSession, command: CommandType) -> None:
+# — or —
+async def handler(session: EngineSession, command: CommandType) -> None:
+```
+
+`session.handle()` awaits the result automatically if it's awaitable. See `undo_last_edit` and `shutdown` for the async pattern, and `open_file`/`abort_agent` for the sync pattern.
+
+Every existing handler follows these conventions:
+
+<Accordion title="Guard first with _require_session()">
+  Nearly every handler starts with:
+
+  ```python
+  if not session._require_session():
+      return
+  ```
+
+  This checks that `session._state.session_id is not None` and emits `ErrorOccurred("no active session; start one first")` itself on failure. Don't duplicate the message — just return on `False`. The only handlers that skip this guard are those that make sense without an active session (`StartSession` itself, `ListSessions`).
+</Accordion>
+
+<Accordion title="Never raise for expected failures">
+  Path errors, unknown IDs, bad input — catch them, emit, and return:
+
+  ```python
+  try:
+      rel = resolve_in_workspace(session._workspace, command.path)
+  except WorkspacePathError as exc:
+      session._emit(ErrorOccurred(message=str(exc)))
+      return
+  ```
+
+  `EngineServer._read_commands` catches anything a handler raises and turns it into `ErrorOccurred(f"{CommandType} failed: {exc}")`, keeping the connection alive. That's a last-resort safety net, not a validation strategy.
+</Accordion>
+
+<Accordion title="Emit events, don't return values">
+  Handlers return `None`. All output goes through `session._emit(some_event)`. A single command can emit zero, one, or several events.
+
+  ```python
+  session._emit(SessionRenamed(name=command.name.strip()))
+  ```
+</Accordion>
+
+<Accordion title="Persist state you mutate">
+  If the handler changes `session._state`, call `session._persist()` before or after emitting so a crash or reconnect doesn't lose it:
+
+  ```python
+  session._state.name = command.name.strip()
+  session._persist()
+  session._emit(SessionRenamed(name=session._state.name))
+  ```
+</Accordion>
+
+<Accordion title="Reuse runtime/tools/* helpers">
+  Command handlers are thin glue over the same primitives the agent's tools use — not a parallel implementation. `undo_last_edit` builds a `ToolContext` by hand and calls `runtime.tools.edits.undo_last` directly, so a human-triggered undo and an agent-triggered undo are identical:
+
+  ```python
+  @handles(UndoLastEdit)
+  async def undo_last_edit(session, command: UndoLastEdit) -> None:
+      if not session._require_session():
+          return
+      ctx = session.tool_context()
+      text = await undo_last(ctx)
+      if text.startswith("error:"):
+          session._emit(ErrorOccurred(message=text))
+  ```
+</Accordion>
+
+<Accordion title="Cap unbounded payloads before emitting">
+  If your event payload could be large (a diff, file content, a big string), clip it yourself before emitting. See `request_git` clipping `staged_diff`/`unstaged_diff` to `EVENT_SOFT_LIMIT // 2` via `clip_text` and reporting omitted bytes as a `WarningOccurred`. The hard `STREAM_LIMIT` (8 MiB) drop in `EngineServer._write_events` is a last-resort safety net, not a truncation feature.
+</Accordion>
+
+## Adding a companion event
+
+If your command needs to emit a new event type, add it the same way in `protocol/events.py`:
+
+```python title="protocol/events.py"
+@event
+@dataclass
+class SessionRenamed(ProtocolMessage):
+    name: str
+```
+
+If the new event carries a payload that can be arbitrarily large (text, diffs, lists), add it to `SIZE_FIELDS` in `runtime/subscriber.py`. That table is what the per-client `Subscriber` queue uses to estimate memory pressure and decide what to evict under backpressure. There is an explicit comment in that file: *"Adding a new event with a large string and not extending this table is a test failure."*
+
+## Session object cheat sheet
+
+The `session` argument in every handler is the live `EngineSession`. Frequently used members:
+
+| Member | What it's for |
+|---|---|
+| `session._workspace` | Resolved `Path` the whole session is bound to |
+| `session._state` | Current `SessionState` (open files, messages, session id) |
+| `session._require_session()` | Guard: emits error + returns `False` if no session started |
+| `session._emit(event)` | Broadcast an event to every connected client |
+| `session._persist()` | Write `_state` to sqlite (no-op if no session id) |
+| `session._config` | `EngineConfig` |
+| `session.language` | Detected `LanguageInfo` for the workspace |
+| `session._lsp` | `LSPManager` or `None` |
+| `session._files` | Shared `FileTracker` (read-before-write bookkeeping) |
+| `session._db_path` | Sqlite path — for building a `ToolContext` to call into `runtime/tools` |
+| `session.tool_context()` | Build a `ToolContext` for calling runtime helpers directly |
+| `session.start_turn(text)` / `session.abort_turn()` | Agent turn control |
+| `session._prompts` | `PromptBroker` for the ask-user/approval flow |
+
+## Command author checklist
+
+<Steps>
+  <Step title="Dataclass in protocol/commands.py">
+    Decorated `@command` then `@dataclass` (outer then inner). Fields typed precisely: `X | None` for optional, `list[str]` for string lists, nested `ProtocolMessage` for structured payloads. No `Any` fields.
+  </Step>
+  <Step title="Codec round-trip test">
+    `decode_command(encode(MyCommand(...)))` round-trips cleanly. See `tests/test_protocol.py` for the existing pattern.
+  </Step>
+  <Step title="Handler under runtime/commands/">
+    Decorated `@handles(MyCommand)`. Can be sync or async. Follows all five conventions above (guard, no raise, emit, persist, cap).
+  </Step>
+  <Step title="Import new handler module">
+    If you added a new module, add `from runtime.commands import my_module as _my_module  # noqa: F401` to `runtime/commands/__init__.py`.
+  </Step>
+  <Step title="Guard with _require_session()">
+    Every handler that requires an active session starts with this guard — unless the command is explicitly meant to work before `StartSession`.
+  </Step>
+  <Step title="Handle failures gracefully">
+    All expected failure paths call `session._emit(ErrorOccurred(message=...))` and `return`. Never raise for client-triggerable errors.
+  </Step>
+  <Step title="Persist mutations">
+    Any change to `session._state` is followed by `session._persist()`.
+  </Step>
+  <Step title="Register new event payloads">
+    If your command emits a new event with a large string field, add it to `SIZE_FIELDS` in `runtime/subscriber.py` and clip the source before emitting.
+  </Step>
+  <Step title="Handler-level test">
+    Drive the command through a real `EngineSession` (not just the codec). See `tests/test_turn_control.py` and `tests/test_concurrency.py` for examples.
+  </Step>
+</Steps>

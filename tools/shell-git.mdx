@@ -1,0 +1,241 @@
+---
+title: "Shell and Git Tools: Execute Commands and Query History"
+sidebarTitle: "Shell & Git"
+description: "Run async shell commands with approval gating and output capping, plus six read-only git tools for status, diffs, log, blame, show, and range comparisons."
+---
+
+The shell and git tools give agents controlled access to the host environment. Shell execution is gated by an approval policy and hard-blocked for dangerous patterns. The git tools are purely read-only — they never commit, push, or modify the repository state.
+
+---
+
+## `run_command`
+
+```python
+async run_command(ctx: ToolContext, command: str, cwd: str = "", timeout: int = 120) -> str
+```
+
+Runs a shell command asynchronously in the workspace. The command executes in a new session group (no TTY) so interactive prompts hang rather than stall — avoid commands that require user input. Non-zero exit codes are not errors from the tool's perspective; they are information returned in the output.
+
+### Parameters
+
+<ParamField path="command" type="str" required>
+  Shell command string. Executed via `/bin/sh -c` with `ulimit -f` applied.
+</ParamField>
+
+<ParamField path="cwd" type="str" default='""'>
+  Optional workspace-relative working directory. Must be an existing directory inside the workspace. Empty means the workspace root.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="120">
+  Timeout in seconds. Clamped to `[1, 600]`. When exceeded, the entire process group is sent `SIGTERM`, then `SIGKILL` after 3 seconds.
+</ParamField>
+
+### Return value
+
+```
+$ pytest tests/
+exit code: 1  (4.2s)
+--- stdout ---
+FAILED tests/test_session.py::test_timeout - AssertionError
+--- stderr ---
+(empty)
+```
+
+On timeout, an additional line is appended: `(timed out after Ns; process group killed)`.
+
+### Approval modes
+
+The `exec_approval` config field controls when user approval is requested:
+
+| Mode | Behaviour |
+|---|---|
+| `auto` (default) | Read-only prefixes and simple commands are auto-allowed; everything else asks for approval |
+| `always` | Every command asks for approval, no exceptions |
+| `never` | All commands execute without asking (use only in fully trusted environments) |
+
+**Auto-allowed prefixes** (no approval needed in `auto` mode, unless the command contains shell metacharacters `;`, `|`, `&`, `` ` ``, `>`):
+
+`git status`, `git diff`, `git log`, `git show`, `ls`, `cat`, `pwd`, `which`, `python -V`, `python --version`, `pytest`, `npm test`, `go test`, `go build`, `cargo test`, `make test`, `ruff`, `mypy`, `tsc --noEmit`
+
+### Hard denials
+
+Two patterns are unconditionally rejected, regardless of approval mode:
+
+- Any command containing `sudo` (as a word or prefix)
+- Any command containing `.engine` (protects the engine state directory)
+
+### Environment
+
+- `OPENROUTER_*` environment variables are stripped from the subprocess environment.
+- `PYTHONUNBUFFERED=1`, `CI=1`, and `TERM=dumb` are always set.
+- A `ulimit -f` write limit is applied based on `exec_file_limit_mb` (default 2 GiB = 2,048 MiB × 2,048 blocks/MiB).
+
+### Output caps
+
+| Cap | Value |
+|---|---|
+| Per-stream (stdout/stderr) | 30,000 characters |
+| Combined total | 60,000 characters |
+
+When a stream is truncated, the middle is elided: `... (N chars elided) ...`.
+
+---
+
+## `git_status`
+
+```python
+git_status(ctx: ToolContext) -> str
+```
+
+Reports the current branch, dirty flag, and lists of staged, unstaged, and untracked paths.
+
+### Return value
+
+```
+branch: main
+dirty: True
+staged: src/main.py
+unstaged: runtime/config.py, tests/test_main.py
+untracked: notes.txt
+```
+
+Returns `not a git repository` when the workspace has no `.git` directory.
+
+---
+
+## `git_diff`
+
+```python
+git_diff(ctx: ToolContext, staged: bool = False) -> str
+```
+
+Returns the unified diff for the worktree (`staged=False`) or the staging index (`staged=True`).
+
+### Parameters
+
+<ParamField path="staged" type="bool" default="False">
+  When `True`, shows the diff of staged (cached) changes — equivalent to `git diff --cached`. When `False`, shows unstaged worktree changes.
+</ParamField>
+
+### Return value
+
+The raw `git diff` output, or `(no diff)` when the selected area is clean. Returns `not a git repository` when outside a git repo.
+
+---
+
+## `git_log`
+
+```python
+git_log(ctx: ToolContext, max: int = 20, path: str = "") -> str
+```
+
+Returns recent commits in `--oneline` format: `<short-sha> <subject>`.
+
+### Parameters
+
+<ParamField path="max" type="int" default="20">
+  Number of commits to return. Clamped to `[1, 50]` (`LOG_MAX = 50`).
+</ParamField>
+
+<ParamField path="path" type="str" default='""'>
+  Optional workspace-relative path to filter the log to commits that touched that file or directory.
+</ParamField>
+
+### Return value
+
+```
+a1b2c3d feat: add EngineSession timeout
+e4f5a6b fix: resolve config race condition
+...
+```
+
+Returns `(no commits)` for a repository with no history, or `not a git repository`.
+
+---
+
+## `git_show`
+
+```python
+git_show(ctx: ToolContext, rev: str) -> str
+```
+
+Shows the metadata, file stat, and patch for a single commit, tag, or ref. Output is clipped to 40,000 characters (`SHOW_CAP`).
+
+### Parameters
+
+<ParamField path="rev" type="str" required>
+  Any git revision: short SHA, full SHA, tag name, or ref like `HEAD~2`.
+</ParamField>
+
+### Return value
+
+The combined output of `git show --stat --format=fuller <rev>` and `git show --format= <rev>` (the patch). Truncated with `...[truncated]` if over the cap.
+
+---
+
+## `git_blame`
+
+```python
+git_blame(ctx: ToolContext, path: str, start_line: int = 0, end_line: int = 0) -> str
+```
+
+Annotates each line of `path` with the commit SHA, author, and date that last changed it. Pass a line window to blame only part of a file.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative file path.
+</ParamField>
+
+<ParamField path="start_line" type="int" default="0">
+  1-based start line. Pass `0` to blame the whole file.
+</ParamField>
+
+<ParamField path="end_line" type="int" default="0">
+  1-based end line. When `start_line > 0` and `end_line = 0`, blames only `start_line`.
+</ParamField>
+
+### Return value
+
+Raw `git blame` output, clipped to 20,000 characters (`BLAME_CAP`). Returns an error string if the path is outside the workspace or not tracked.
+
+### Example
+
+```python
+# Blame lines 40-60 of a file
+git_blame(ctx, "runtime/session.py", start_line=40, end_line=60)
+```
+
+---
+
+## `git_range`
+
+```python
+git_range(ctx: ToolContext, base: str, head: str) -> str
+```
+
+Shows the commits and file diffstat for the symmetric difference `base...head` — i.e. commits reachable from `head` but not `base`. Useful for reviewing what a branch or PR adds.
+
+### Parameters
+
+<ParamField path="base" type="str" required>
+  Base ref (e.g. `main`, a SHA, or `HEAD~5`).
+</ParamField>
+
+<ParamField path="head" type="str" required>
+  Head ref (e.g. `HEAD`, a branch name, or a SHA).
+</ParamField>
+
+### Return value
+
+```
+commits main...feature/timeout:
+a1b2c3d feat: add configurable session timeout
+e4f5a6b test: cover timeout edge cases
+
+ runtime/config.py  | 12 +++++++++---
+ runtime/session.py | 24 ++++++++++++++++++------
+ tests/test_session.py | 38 ++++++++++++++++++++++++++++++++++++--
+```
+
+Capped at 40,000 characters. Returns an error when either ref is not found.

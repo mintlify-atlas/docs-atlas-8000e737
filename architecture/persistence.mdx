@@ -1,0 +1,200 @@
+---
+title: "Persistence: SQLite Snapshots and Memory Store"
+sidebarTitle: "Persistence"
+description: "A complete guide to the .engine/ directory layout, the SQLite sessions and edits tables, the memory.json knowledge store, and what survives a server restart."
+---
+
+CodeLoom Engine writes all persistent state under a single `.engine/` directory at the workspace root. This directory is the only place the engine touches outside the workspace files it edits. Understanding its contents tells you exactly what survives a server restart, what you can safely delete to reset state, and what the reconnection flow replays.
+
+## The `.engine/` directory layout
+
+```text
+.engine/
+├── engine.sock          # Unix domain socket (deleted on clean shutdown)
+├── session.db           # SQLite database: sessions table + edits table
+├── memory.json          # Structured workspace knowledge (files + decisions)
+├── mcp-tokens.json      # Encrypted tokens for authenticated MCP servers
+├── trace.jsonl          # Per-call trace log (only if ENGINE_TRACE_CALLS=true)
+├── skills/              # Custom SKILL.md directories
+│   └── {name}/
+│       └── SKILL.md
+└── worktrees/           # Git worktrees for active writer agents
+    └── {agent_id}/      # Isolated checkout on engine/{profile}/{agent_id}
+```
+
+<CardGroup cols={2}>
+  <Card title="engine.sock" icon="plug">
+    The `AF_UNIX` socket created by `EngineServer.serve()`. It is unlinked before binding (to clear stale sockets from crashed processes) and again on clean shutdown. If the socket file exists but nothing is listening, the engine is not running against this workspace.
+  </Card>
+  <Card title="session.db" icon="database">
+    SQLite database initialised by `runtime/store/sqlite.init()`. Contains two tables: `sessions` (chat history, open files, stats) and `edits` (full byte snapshots for every agent write). Both tables are created with `CREATE TABLE IF NOT EXISTS`.
+  </Card>
+  <Card title="memory.json" icon="brain">
+    Structured workspace knowledge accumulated by agents. Written by `runtime/store/memory.py` under a `threading.Lock`. Survives restarts; stale file notes (SHA mismatch) are flagged but not deleted automatically.
+  </Card>
+  <Card title="trace.jsonl" icon="file-lines">
+    Appended by `TraceWriter` when `ENGINE_TRACE_CALLS=true`. One JSON object per line, each with `type`, `call_id`, `name`, `agent_id`, `profile`, `arguments`, `result`, `ok`, `duration_ms`, and `reasoning`. Useful for offline replay and debugging.
+  </Card>
+</CardGroup>
+
+## SQLite schema
+
+`session.db` holds two tables. Both are initialised on `EngineSession.start()` via `runtime/store/sqlite.init(db_path)`.
+
+### `sessions` table
+
+```sql
+CREATE TABLE IF NOT EXISTS sessions (
+  id         TEXT PRIMARY KEY,
+  json       TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  saved_at   TEXT NOT NULL
+);
+```
+
+The `json` column holds the serialised `EngineSnapshot` for the session. `_persist_payload` strips volatile fields before saving so the stored blob is stable across restarts:
+
+| Stripped field | Reason |
+|---|---|
+| `file_tree` | Rebuilt from disk on reconnect |
+| `git` | Read fresh from the workspace on reconnect |
+| `language` / `language_supported` | Re-detected on bind |
+| `pending_prompt` | In-flight prompt cannot survive a restart |
+| `agents` | Live agent list is meaningless after a restart |
+
+What **is** persisted: `session_id`, `workspace`, `messages` (full chat history including role, text, and timestamp), `open_files` (path list), `ended`, and `stats` (token/cost/request counters).
+
+`save(path, snapshot)` uses an `INSERT … ON CONFLICT DO UPDATE` so the row is upserted on every `_persist()` call. `_persist()` is called after every user message, every turn completion, and on `Shutdown`.
+
+### `edits` table
+
+```sql
+CREATE TABLE IF NOT EXISTS edits (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id   TEXT NOT NULL,
+  batch_id     TEXT,
+  path         TEXT NOT NULL,
+  tool         TEXT NOT NULL,
+  before       BLOB,
+  after        BLOB,
+  before_sha   TEXT,
+  after_sha    TEXT,
+  diff         TEXT,
+  created_dirs TEXT,
+  applied_at   TEXT NOT NULL
+);
+```
+
+<ParamField path="before / after" type="BLOB">
+  Full byte content of the file before and after the edit. `NULL before` means the file was created (did not exist). `NULL after` means the file was deleted. Storing complete byte snapshots rather than diffs makes undo exact and independent of patch application order.
+</ParamField>
+
+<ParamField path="batch_id" type="TEXT">
+  UUID that groups multi-file edits into one logical operation. Server-side renames (`rename_symbol`) produce multiple records with the same `batch_id`. `undo_edit` fetches all records for the latest `batch_id` and reverses them as a unit.
+</ParamField>
+
+<ParamField path="created_dirs" type="TEXT">
+  JSON array of directory paths created as a side effect of this edit (e.g. parent directories of a newly created file). Undo removes them if empty.
+</ParamField>
+
+<ParamField path="applied_at" type="TEXT">
+  ISO-8601 UTC timestamp set at insert time.
+</ParamField>
+
+## `memory.json` structure
+
+`memory.json` is a structured knowledge store written and read by `runtime/store/memory.py` under a `threading.Lock`. Agents populate it via the `remember` tool; `ask`, `coder`, and `researcher` briefings are also ingested automatically when those agents finish.
+
+```json
+{
+  "files": {
+    "src/main.py": {
+      "purpose": "Entry point; parses args and boots the server",
+      "entry_points": "main(), parse_args()",
+      "constraints": "Must not import agent internals",
+      "note": "Reads env.sh via load_env_sh before constructing EngineConfig",
+      "note_sha": "abc123...",
+      "seen_sha": "abc123...",
+      "action": "read",
+      "updated_at": "2025-01-15T10:30:00+00:00"
+    }
+  },
+  "engineering": [
+    { "text": "Use asyncio.Lock for write serialisation, not threading.Lock", "updated_at": "..." }
+  ],
+  "product": [
+    { "text": "Protocol must never require clients to import engine code", "updated_at": "..." }
+  ],
+  "cicd": [
+    { "text": "pytest --cov runs on every push; coverage badge regenerated on main", "updated_at": "..." }
+  ],
+  "other": []
+}
+```
+
+<ResponseField name="files" type="object">
+  A map from workspace-relative path to a file-note entry. Capped at 40 entries (oldest pruned). Each entry tracks:
+  - `purpose` — what the file does (≤200 chars)
+  - `entry_points` — key functions or classes (≤200 chars)
+  - `constraints` — important rules or caveats (≤200 chars)
+  - `note` — freeform blurb (≤400 chars)
+  - `note_sha` — SHA-256 of the file bytes when the note was written; used to detect staleness
+  - `seen_sha` — SHA-256 of the file bytes the last time it was read or edited
+  - `action` — `"read"` or `"edit"` (last agent action on this file)
+  - `updated_at` — ISO-8601 UTC timestamp
+</ResponseField>
+
+<ResponseField name="engineering / product / cicd / other" type="array">
+  Append-only decision logs. Each entry is `{ "text": "...", "updated_at": "..." }`. Capped at 12 entries per section (oldest pruned). The `remember` tool appends here with `section=engineering`, `section=product`, `section=cicd`, or `section=other`.
+</ResponseField>
+
+**Staleness detection.** When the engine renders memory into the system prompt (`render_memory`), it compares `note_sha` against the current disk SHA for each file. A mismatch sets `stale=True` in the rendered output so the orchestrator can instruct agents to re-survey the file rather than trusting an outdated description. Stale notes are **not deleted automatically** — they survive until overwritten by a fresh `remember` call.
+
+**Ingest-on-finish.** `ingest_result` (`runtime/store/memory.py`) is called by `Orchestrator._run_child` after each `ask`, `coder`, or `researcher` finishes. It parses the labeled briefing fields (`what`, `paths`, `facts`, `verdict`, `leftover`) and upserts file notes for up to 8 paths (`INGEST_FILE_CAP`) touched or surveyed by the child.
+
+## Reconnection and snapshot reload
+
+When a client sends `StartSession` with an existing `session_id`, the engine calls `sqlite.load(db_path, session_id)` to fetch the stored `EngineSnapshot`. The flow is:
+
+<Steps>
+  <Step title="Load snapshot from SQLite">
+    `sqlite.load` deserialises the JSON blob from the `sessions` table into an `EngineSnapshot`. If no row is found, a fresh session is created.
+  </Step>
+  <Step title="Hydrate orchestrator history">
+    `SessionState.from_snapshot(snap)` rebuilds in-memory state from the snapshot. `EngineSession._bind_loop` calls `self._loop.hydrate(self._state.messages)`, which replays `user`, `engine` (as `user`), and `assistant` messages into the orchestrator's `_history`. Tool messages and subagent transcripts are **not rehydrated** — they never existed in the orch's history.
+  </Step>
+  <Step title="Recover worktrees">
+    `Orchestrator._recover_worktrees` scans `workspace/.engine/worktrees/` for leftover worktrees from agents that were running when the server last shut down. Worktrees with no unique commits and a clean tree are dropped silently; others are re-registered so the orchestrator can still `settle_worktree` them.
+  </Step>
+  <Step title="Emit snapshot to client">
+    `_emit_snapshot(replay=True)` sends the `SnapshotReady` event (with `messages` emptied and `message_count` set), followed by `FileContent` for each open file, followed by `ChatHistoryAdded` events replayed from a background task (one per message, yielding between messages via `asyncio.sleep(0)` to avoid blocking the loop). A generation counter ensures a second `RequestSnapshot` during replay cancels the first stream rather than interleaving two histories.
+  </Step>
+</Steps>
+
+## What survives a restart
+
+<Tabs>
+  <Tab title="Persisted ✓">
+    - Full chat history (`user`, `assistant`, `engine` messages)
+    - Open file list (paths only; content is refreshed from disk)
+    - Cumulative token / cost / request stats
+    - All edit journal records (before/after bytes, batch IDs, diffs)
+    - Workspace memory (`memory.json`) — file notes and decision logs
+    - MCP auth tokens (`mcp-tokens.json`)
+    - Git worktrees with uncommitted changes
+    - Skills under `.engine/skills/`
+  </Tab>
+  <Tab title="Not persisted ✗">
+    - In-flight LLM streams (abort on restart)
+    - Active agent tasks and subagent transcripts
+    - `FileTracker` state — the staleness map resets, so agents must `read_file` before editing after reconnect
+    - Pending user prompts (`PromptBroker` queue)
+    - Live subprocess handles (`run_command` processes)
+    - `AgentStateChanged` — all agents start `idle` after reconnect
+    - In-memory `_pending_user` and `_inbox` queues
+  </Tab>
+</Tabs>
+
+<Warning>
+  `FileTracker` is recreated fresh on every `StartSession`. This means a resumed session starts with no recorded SHAs, and the write funnel will reject any edit attempt with `error: read {path} before editing it` until the agent re-reads the file. This is intentional: the file may have changed while the engine was down.
+</Warning>

@@ -1,0 +1,296 @@
+---
+title: "File Editing Tools: Modify Code with Safety Guarantees"
+sidebarTitle: "Editing"
+description: "Nine editing tools route every write through a safety funnel: syntax gate, FileTracker staleness check, atomic replace, and session journal for undo."
+---
+
+All file modifications in CodeLoom Engine pass through a single write funnel (`runtime/tools/edits.py`). The funnel enforces three invariants before any byte hits disk: the file must have been read in this session (FileTracker), the syntax gate must not introduce new parse errors, and the write is atomic via a `rename(2)` to a temp file. Every committed edit is journaled for `undo_edit`.
+
+<Warning>
+Always call `read_file` on a file before editing it. The editing tools check a SHA-256 hash stored by `read_file` in the session's `FileTracker`. An edit on a file you haven't read — or on a file that changed on disk since you read it — is rejected with an error.
+</Warning>
+
+---
+
+## `str_replace`
+
+```python
+async str_replace(ctx: ToolContext, path: str, old_string: str, new_string: str) -> str
+```
+
+Replaces the single occurrence of `old_string` in the file with `new_string`. The match must be unique — if `old_string` appears zero or more than one time, the tool returns an error instead of guessing.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path to the file.
+</ParamField>
+
+<ParamField path="old_string" type="str" required>
+  The exact substring to replace. Must appear exactly once in the file. Include enough surrounding context (blank lines, adjacent statements) to make the match unique.
+</ParamField>
+
+<ParamField path="new_string" type="str" required>
+  Replacement text. May be empty to delete the matched substring.
+</ParamField>
+
+### Return value
+
+On success: `ok: edited <path>` followed by a unified diff (capped at 4,000 characters).  
+On failure: an `error:` string explaining the mismatch, including the line numbers of all occurrences when there are multiple matches.
+
+### Constraints
+
+- Zero matches → error with a hint pointing to the closest similar block.
+- Multiple matches → error listing all matching line numbers; add more context to `old_string`.
+- Whitespace drift → error noting the line where the match exists with different indentation.
+
+---
+
+## `replace_lines`
+
+```python
+async replace_lines(ctx: ToolContext, path: str, start: int, end: int, new_text: str) -> str
+```
+
+Replaces an inclusive 1-based line range `[start, end]` with `new_text`. The range mirrors the `lines M-N of T` header produced by `read_file`.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="start" type="int" required>
+  First line to replace (1-based, inclusive).
+</ParamField>
+
+<ParamField path="end" type="int" required>
+  Last line to replace (1-based, inclusive). Must be ≥ `start`.
+</ParamField>
+
+<ParamField path="new_text" type="str" required>
+  Replacement text for the range. A trailing newline is added automatically when the replaced range is not the last line.
+</ParamField>
+
+### Return value
+
+`ok: edited <path>` plus a unified diff on success, or an `error:` string on failure.
+
+### Constraints
+
+- `start > total_lines` or `end > total_lines` → error.
+- `end < start` → error.
+- Empty file → only `start=1, end=1` is valid; use `insert_at_line` or `create_file` for empty files.
+
+---
+
+## `insert_at_line`
+
+```python
+async insert_at_line(ctx: ToolContext, path: str, line: int, new_text: str) -> str
+```
+
+Inserts `new_text` immediately before the 1-based `line`. Passing `line = len(file) + 1` appends to the end of the file.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number to insert before. Valid range: `1` to `total_lines + 1`.
+</ParamField>
+
+<ParamField path="new_text" type="str" required>
+  Text to insert. A trailing newline is appended automatically if absent.
+</ParamField>
+
+### Return value
+
+`ok: edited <path>` plus a diff on success.
+
+---
+
+## `create_file`
+
+```python
+async create_file(ctx: ToolContext, path: str, content: str) -> str
+```
+
+Creates a new file at `path` with the given `content`. Parent directories are created automatically. Fails if the file already exists — use `str_replace` or `replace_lines` to modify an existing file.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path for the new file.
+</ParamField>
+
+<ParamField path="content" type="str" required>
+  Full file contents.
+</ParamField>
+
+### Return value
+
+`ok: created <path>` plus the creation diff on success. Returns `error: file already exists: <path>` if the path is occupied.
+
+### Constraints
+
+- The syntax gate runs on the new content. If the file extension maps to a supported language (Python, Go, JavaScript, TypeScript) and the content has parse errors that are absent from an empty file, the create is rejected.
+- The file is written atomically via a hardlink from a temp file; a race with another writer is detected.
+
+---
+
+## `apply_patch`
+
+```python
+async apply_patch(ctx: ToolContext, path: str, patch: str) -> str
+```
+
+Applies a unified diff (`---`/`+++` headers are optional; `@@` hunk headers are required) to the file. All hunks are located and applied in a single transaction — if any hunk fails to match, the entire patch is rejected and the file is unchanged.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="patch" type="str" required>
+  Unified diff string. The `---`/`+++` header lines are stripped and ignored; only `@@ -L,N +L,N @@` hunks and their context/add/delete lines are used.
+</ParamField>
+
+### Return value
+
+`ok: edited <path>` plus the applied diff on success.
+
+### Hunk matching
+
+The engine uses a `HUNK_FUZZ = 5` line-offset tolerance: each hunk is first tried at its declared line number, then searched up to 5 lines earlier and 5 lines later. A hunk with zero old-lines (pure insertion) is placed at the declared position without matching.
+
+<Note>
+When a diff was generated against a slightly different version of the file (e.g. after a few unrelated edits), `HUNK_FUZZ=5` absorbs small drift. Larger drift requires regenerating the patch from a fresh `read_file`.
+</Note>
+
+---
+
+## `replace_symbol`
+
+```python
+async replace_symbol(ctx: ToolContext, path: str, symbol: str, new_body: str, language: str = "") -> str
+```
+
+Locates a named function, class, or method in the file using the tree-sitter parser and replaces its entire source span with `new_body`. More robust than `str_replace` when the symbol's internal whitespace varies, but `new_body` must be the complete replacement text — partial fragments are not supported.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="symbol" type="str" required>
+  The identifier name of the definition to replace (function, class, method, type).
+</ParamField>
+
+<ParamField path="new_body" type="str" required>
+  Full replacement text for the entire definition, including decorators and docstrings.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Optional grammar override: `python`, `go`, `javascript`, `typescript`. When empty, the language is inferred from the file extension.
+</ParamField>
+
+### Return value
+
+`ok: edited <path>` plus a diff on success. Returns an error if the symbol is not found or if the file's extension has no registered grammar.
+
+---
+
+## `insert_after_imports`
+
+```python
+async insert_after_imports(ctx: ToolContext, path: str, snippet: str, language: str = "") -> str
+```
+
+Parses the file with tree-sitter, finds the last import statement, and inserts `snippet` immediately after it. If the file has no imports, the snippet is prepended to the top of the file.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="snippet" type="str" required>
+  Text to insert after the import block. A newline is appended if the snippet does not end with one.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Optional grammar override.
+</ParamField>
+
+### Return value
+
+`ok: edited <path>` plus a diff on success.
+
+---
+
+## `undo_edit`
+
+```python
+async undo_edit(ctx: ToolContext) -> str
+```
+
+Reverts the most recent edit batch recorded in the session journal. A "batch" is all file writes that happened in a single tool call (including multi-file operations like `rename_symbol`). Before reverting, the tool verifies that each file's current SHA-256 matches the SHA recorded immediately after the edit — if any file changed on disk in the interim, the undo is refused.
+
+### Parameters
+
+<ParamField path="ctx" type="ToolContext" required>
+  Injected tool context. Requires an active session journal; returns an error if the journal is unavailable.
+</ParamField>
+
+### Return value
+
+`ok: undone <path>` followed by the reverse diff on success. On failure: `error: <path> changed on disk since the edit; refusing to clobber` or `error: no edits to undo`.
+
+### Constraints
+
+- Can only undo the single most recent batch. Call repeatedly to step back through multiple batches.
+- The undo itself is journaled as a new batch, so it can itself be undone.
+- Requires `ctx.journal` to be set; returns an error for sessions without a journal.
+
+---
+
+## `list_edits`
+
+```python
+list_edits(ctx: ToolContext, limit: int = 20) -> str
+```
+
+Returns a text summary of recent edits in the current session, newest first. Each entry shows the edit ID, operation kind (`create`, `edit`, `delete`), path, tool name, timestamp, and a diff snippet (capped at 500 characters per entry).
+
+### Parameters
+
+<ParamField path="ctx" type="ToolContext" required>
+  Injected tool context.
+</ParamField>
+
+<ParamField path="limit" type="int" default="20">
+  Maximum number of edits to show.
+</ParamField>
+
+### Return value
+
+A text block with one record per edit, or `(no edits this session)` when the journal is empty. Returns `error: edit journal is not available` if `ctx.journal` is not set.
+
+### Example output
+
+```
+#12  edit  src/main.py  str_replace  2025-01-15T10:22:01Z
+--- a/src/main.py
++++ b/src/main.py
+@@ -5,7 +5,7 @@
+-    return old_value
++    return new_value
+
+#11  create  tests/test_new.py  create_file  2025-01-15T10:21:44Z
+```

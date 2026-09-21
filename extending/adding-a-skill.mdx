@@ -1,0 +1,205 @@
+---
+title: "Create a Reusable Skill for Agent Context Injection"
+sidebarTitle: "Adding a Skill"
+description: "Write a SKILL.md file, choose a discovery location, package sibling files, and understand how the lexical ranking algorithm surfaces skills to agents."
+---
+
+Skills are context packages the engine injects into an agent's working memory on demand. Each skill is a directory containing a `SKILL.md` file (with YAML frontmatter) plus any sibling files the agent can request with `read_skill`. Clients never parse `SKILL.md` directly — the engine discovers skills on `StartSession`, builds a catalog, and exposes them to agents by name.
+
+When an agent calls `activate_skill("docs")`, the body of that skill's `SKILL.md` is attached to that agent's context for the rest of its run. No other agent in the session is affected unless it also activates the skill.
+
+## Discovery priority
+
+The engine searches three locations in order. The **first match on name wins** — workspace-local skills shadow global ones:
+
+<Steps>
+  <Step title=".engine/skills/ (workspace-local)">
+    `{workspace}/.engine/skills/<name>/SKILL.md`
+
+    Use this for project-specific skills: coding conventions, CI commands, domain glossary.
+  </Step>
+  <Step title=".cursor/skills/ (Cursor-compatible)">
+    `{workspace}/.cursor/skills/<name>/SKILL.md`
+
+    Shared with Cursor's skill format if you use both tools on the same project.
+  </Step>
+  <Step title="~/.engine/skills/ (user-global)">
+    `~/.engine/skills/<name>/SKILL.md`
+
+    Personal skills available in every workspace: preferred code style, common snippets, personal workflows.
+  </Step>
+</Steps>
+
+<Warning>
+  Do not put skills under `~/.cursor/skills-cursor/` — that directory is intentionally ignored by the engine's discovery logic.
+</Warning>
+
+The discovery implementation in `runtime/skills/discover.py` iterates the three roots, reads each `SKILL.md`, and stops at the first occurrence of any given name:
+
+```python title="runtime/skills/discover.py (excerpt)"
+roots = [
+    ("engine", workspace / ".engine" / "skills"),
+    ("cursor", workspace / ".cursor" / "skills"),
+    ("user",   home / ".engine" / "skills"),
+]
+by_name: dict[str, Skill] = {}
+for source, root in roots:
+    for child in sorted(root.iterdir()):
+        md = child / "SKILL.md" if child.is_dir() else None
+        ...
+        name = (meta.get("name") or child.name).strip()
+        if not name or name in by_name:
+            continue          # workspace-local wins; later roots are skipped
+        by_name[name] = skill
+```
+
+## Skill directory layout
+
+A skill is a directory. The only required file is `SKILL.md`. Everything else is optional sibling content the agent can fetch with `read_skill(name, path)`.
+
+```
+.engine/skills/
+└── docs/
+    ├── SKILL.md          ← required; frontmatter + body
+    ├── reference.md      ← sibling: agent can call read_skill("docs", "reference.md")
+    └── scripts/
+        └── check.sh      ← sibling: agent can read or (if allowed) run it
+```
+
+## SKILL.md format
+
+The file uses YAML frontmatter (delimited by `---`) followed by the skill body. The body is plain Markdown and is what the agent sees after activation.
+
+```markdown title=".engine/skills/docs/SKILL.md"
+---
+name: docs
+description: Write or update markdown docs. Use when the user mentions README or docs.
+---
+
+# Documentation Conventions
+
+Only edit files under `docs/` or files ending in `.md`.
+
+- Link to the API reference from [reference.md](reference.md).
+- Keep headings in sentence case, not Title Case.
+- Code blocks must have a language tag.
+```
+
+<ParamField path="name" type="string" required>
+  The unique name used with `activate_skill` and `read_skill`. If omitted, the containing directory name is used as a fallback.
+</ParamField>
+
+<ParamField path="description" type="string" required>
+  A short phrase shown alongside the name in the skill catalog. Used by the lexical ranking algorithm to match query tokens — be specific about when the skill applies.
+</ParamField>
+
+<ParamField path="disable-model-invocation" type="boolean" default="false">
+  When `true`, the skill name is hidden from the model's auto-ranked catalog. The skill will only become visible to an agent after a client sends the `ActivateSkill` command (session-level unlock) or the agent itself calls `activate_skill` explicitly. Use this for sensitive or highly specialized skills you don't want surfaced automatically.
+</ParamField>
+
+## Sibling files and read_skill
+
+Sibling files inside the skill directory can be read by the agent using `read_skill(name, path)`. The implementation in `runtime/skills/discover.py` enforces that the path stays inside the skill directory:
+
+```python title="runtime/skills/discover.py"
+def read_skill_file(skill: Skill, rel: str) -> str:
+    root = skill.directory.resolve()
+    target = (root / rel).resolve()
+    target.relative_to(root)   # raises ValueError if path escapes
+    return target.read_text(encoding="utf-8")
+```
+
+An agent activates the skill body and then fetches a sibling:
+
+```
+activate_skill("docs")
+# → body of SKILL.md is now in context
+
+read_skill("docs", "reference.md")
+# → raw content of .engine/skills/docs/reference.md
+```
+
+<Note>
+  `read_skill` enforces containment: any path that would escape the skill directory raises an error. You cannot use `read_skill` to read arbitrary workspace files.
+</Note>
+
+## disable-model-invocation and manual activation
+
+Skills marked `disable-model-invocation: true` have `auto=False` in the engine's `Skill` object. The catalog's `names()` method filters them out unless they appear in the `unlocked` or `activated` sets:
+
+```python title="runtime/skills/catalog.py (excerpt)"
+def names(self, *, unlocked=None, activated=None) -> list[str]:
+    extra = set(unlocked or ()) | set(activated or ())
+    return [
+        item.name
+        for item in self._skills.values()
+        if item.auto or item.name in extra
+    ]
+```
+
+Two ways to unlock a `disable-model-invocation` skill:
+
+| Mechanism | Scope |
+|---|---|
+| `ActivateSkill` command (client → engine) | Session-level unlock — adds the name to the orch catalog so every agent in the session can see it |
+| `activate_skill` tool (agent → engine) | Per-agent activation — attaches the body to that `AgentLoop` only, for the duration of the run |
+
+The orchestrator and every profile have both `activate_skill` and `read_skill` in their default tool sets.
+
+## Lexical ranking algorithm
+
+Each agent turn, the engine shows the model a ranked subset of skill descriptions so the model can decide what to activate. The ranking is a token-overlap score computed in `runtime/skills/catalog.py`:
+
+```python title="runtime/skills/catalog.py"
+_TOKEN = re.compile(r"[a-z0-9]+")
+
+def lexical_score(query: str, skill: Skill) -> int:
+    needles = set(_TOKEN.findall((query or "").lower()))
+    hay     = set(_TOKEN.findall(f"{skill.name} {skill.description}".lower()))
+    if not needles:
+        return 0
+    return len(needles & hay)   # count of overlapping tokens
+```
+
+The top-8 scoring skills get their descriptions shown. Skills the model has already seen on this agent are "sticky" and stay visible (up to a cap of 12 total) even if their score drops in a later turn:
+
+```python title="runtime/skills/catalog.py"
+TOP_K     = 8
+STICKY_CAP = 12
+
+def rank_descriptions(skills, query, sticky, *, top_k=TOP_K, sticky_cap=STICKY_CAP):
+    scored = [(lexical_score(query, item), item.name) for item in skills]
+    scored.sort(key=lambda pair: (-pair[0], pair[1]))
+    top = {name for _, name in scored[:top_k]}
+    shown = top | (sticky & {item.name for item in skills})
+    if len(shown) > sticky_cap:
+        # drop lowest-scoring sticky-only entries
+        ...
+    sticky.clear()
+    sticky.update(shown)
+    return shown
+```
+
+<Tip>
+  Write skill descriptions with concrete, task-specific nouns — the same words a user might use in a prompt. A description like `"Use when editing README or updating documentation"` will score higher on a `"update README"` query than `"Documentation management utility"`.
+</Tip>
+
+## Skill author checklist
+
+<Steps>
+  <Step title="Choose a location">
+    Project-specific → `.engine/skills/<name>/SKILL.md`. Personal/global → `~/.engine/skills/<name>/SKILL.md`. Do not use `.cursor/skills-cursor/`.
+  </Step>
+  <Step title="Write a focused SKILL.md">
+    Include `name` and `description` in the frontmatter. Keep the body concise — it is injected directly into the agent's context and counts against the token budget.
+  </Step>
+  <Step title="Use disable-model-invocation for sensitive skills">
+    Skills with secrets, credentials, or highly specialized instructions should set `disable-model-invocation: true` and be unlocked explicitly via `ActivateSkill` or `activate_skill`.
+  </Step>
+  <Step title="Add sibling files for structured content">
+    Long reference tables, scripts, or checklists that don't need to be in context by default can be put in sibling files and fetched on demand with `read_skill(name, path)`.
+  </Step>
+  <Step title="Write description tokens that match user language">
+    The ranking algorithm matches tokens in the description against the agent's current query. Concrete nouns and verbs score higher than abstract category labels.
+  </Step>
+</Steps>

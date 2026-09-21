@@ -1,0 +1,215 @@
+---
+title: "How the Agent Loop Drives LLM and Tool Turns"
+sidebarTitle: "Agent Loop"
+description: "A deep dive into AgentLoop.run(), turn budgets, concurrent tool dispatch, context compaction strategies, the Orchestrator/Subagent split, and every AgentHooks callback."
+---
+
+Every agent in CodeLoom Engine — whether the user-facing orchestrator or a background `coder` subagent — runs the same core machinery: `AgentLoop` in `agents/agent_loop.py`. Understanding this class is understanding how the engine drives the LLM, manages turn budgets, dispatches tools, and compresses context when conversations grow long. The `Orchestrator` and `Subagent` classes extend `AgentLoop` with exactly the responsibilities their names imply: one coordinates personality spawning, the other runs a single task to completion.
+
+## `AgentLoop.run(task)` — the main execution loop
+
+`run(task)` is the top-level entry point for any agent turn. It takes a task string, appends it to history as a `user` message, then spins in a `while turn < self._config.max_turns` loop:
+
+```python
+# agents/agent_loop.py (simplified)
+async def run(self, task: str) -> str:
+    marker = len(self._history)
+    self._history.append({"role": "user", "content": task})
+    schemas = self._tools.schemas()
+    turn = 0
+    continues = 0
+    closer_ceilings: set[int] = set()
+    original_max_turns = self._config.max_turns
+    try:
+        await self._maybe_compact()
+        while turn < self._config.max_turns:
+            self._maybe_inject_closer(turn, closer_ceilings)
+            self._state("thinking", turn + 1)
+            result = await self._complete(self._build_messages(), schemas)
+            if result.tool_calls:
+                await self._dispatch(result)
+                await self._maybe_compact()
+                turn += 1
+                if turn >= self._config.max_turns:
+                    action = await self._offer_continue(continues)
+                    # "continue" extends budget; "handoff" or "stop" exits
+                    ...
+                continue
+            # No tool calls → assistant finished
+            last_text = result.text
+            self._history.append({"role": "assistant", "content": last_text})
+            self._emit_message(last_text or "")
+            return _last_assistant_text(self._history) or last_text
+    except asyncio.CancelledError:
+        del self._history[marker:]
+        raise
+    except Exception:
+        del self._history[marker:]
+        raise
+    finally:
+        self._config.max_turns = original_max_turns
+```
+
+A single pass through the loop is one **tool turn**: the LLM sees the full context, emits zero or more tool calls, and the results are appended before the next pass. An exception rolls back history to the `marker` taken before the user message was appended so a crash never leaves a half-applied exchange in history.
+
+## Turn budget: `max_turns`, `turn_slice`, and the closer
+
+<CardGroup cols={2}>
+  <Card title="Orchestrator budget" icon="list-ol">
+    Capped at `EngineConfig.max_turns` (default **16**). The orchestrator's primary job is spawning personalities, not doing deep work, so the lower cap is intentional.
+  </Card>
+  <Card title="Subagent budget" icon="code">
+    Each `AgentProfile` carries its own `max_turns` (default **32**). Subagents do real implementation work and need more room.
+  </Card>
+</CardGroup>
+
+**Closer injection.** Two turns before the ceiling, `_maybe_inject_closer` appends a system-side user message:
+
+```python
+CLOSER_MESSAGE = (
+    "You have two tool turns left. Finish the current edit, or write a closer "
+    "with labeled leftover: (paths, done, next). Do not start new exploration."
+)
+```
+
+This is injected at most once per ceiling value (tracked in `closer_ceilings`), so extending the budget after a `continue` grant inserts a new closer at the new ceiling without re-injecting at the old one.
+
+**Continue / handoff / stop.** When `turn >= max_turns` and the agent still has tool calls, `_offer_continue` asks the user (via `PromptBroker`) which action to take:
+
+| Choice | Effect |
+|---|---|
+| `continue` | `max_turns += turn_slice` (default **16**); a `CONTINUE_GRANT` message is injected; `continues` counter increments |
+| `handoff` | Loop exits with `_exit_status = "max_turns"` so the orchestrator can spawn a writer with leftover work |
+| `stop` | Loop exits with `_exit_status = "stopped"` |
+
+`ENGINE_TURN_CONTINUE=never` in `env.sh` skips the prompt and always chooses `handoff`. The `max_continues` ceiling (default **3**) prevents infinite budget extension.
+
+## Tool dispatch: concurrent calls via `asyncio.gather`
+
+When the LLM returns tool calls, `_dispatch(result)` appends the assistant message and executes each call:
+
+```python
+# agents/agent_loop.py
+async def _dispatch(self, result) -> None:
+    self._state("calling_tool")
+    self._history.append({
+        "role": "assistant",
+        "tool_calls": [...],
+    })
+    if self._concurrent_tools and len(result.tool_calls) > 1:
+        outputs = await asyncio.gather(
+            *[self._execute_call(call) for call in result.tool_calls]
+        )
+    else:
+        for call in result.tool_calls:
+            output = await self._execute_call(call)
+            self._history.append({"role": "tool", ...})
+```
+
+The orchestrator sets `concurrent_tools=True` so it can fan out multiple personality spawns in one LLM turn. Subagents also default to `concurrent_tools=True`, but write contention is serialised by the `write_lock` inside `apply_edit` — concurrent reads are fine; concurrent writes to the same file queue behind the lock.
+
+After dispatch, `validate_history` verifies that every `tool_calls` message has a matching `tool` response. A pairing error raises `RuntimeError` immediately rather than letting the LLM see a malformed context.
+
+## Context compaction: `compact()` strategies
+
+`_maybe_compact(force=False)` is called before the first turn and after every tool dispatch. It estimates the current token count and compares it to `config.context_budget * compact_trigger` (orchestrator default: **0.7 × 120,000 = 84,000 tokens**).
+
+```python
+# agents/agent_loop.py
+async def _maybe_compact(self, force: bool = False) -> None:
+    from agents.compactor import estimate_tokens
+    messages = self._build_messages()
+    trigger, keep_full = compact_params(self._config)
+    if not force:
+        estimated = int(estimate_tokens(messages) * (self._estimate_ratio or 1.0))
+        if self._last_prompt_tokens:
+            estimated = max(estimated, self._last_prompt_tokens)
+        if estimated < int(self._config.context_budget * trigger):
+            return
+    ...
+    compacted, info = await compact(messages, self._config.context_budget, ...)
+```
+
+The `compact()` function in `agents/compactor.py` applies strategies in order from cheapest to most lossy:
+
+<Steps>
+  <Step title="trim">
+    `trim_tool_results(messages, keep=keep_full_tools)` trims every tool result older than the most recent `keep_full_tools` (default **3**) to 400 characters, appending a `(trimmed; re-run the tool if you need this again)` notice. This is the first and cheapest pass — no LLM call required.
+  </Step>
+  <Step title="summarize">
+    If still over budget, `_summarize` splits the history into a head (everything before the last two exchanges) and a tail, calls the LLM with a "summarize this transcript" prompt, and replaces the head with a `## Earlier conversation` system message. Summarisation failure falls through gracefully to the next strategy.
+  </Step>
+  <Step title="truncate">
+    Drops all tool result content (`trim_tool_results(keep=0)`), then calls `_drop_oldest` to drop complete message groups from the front of history — keeping the system message and the last user exchange — until the budget is met.
+  </Step>
+  <Step title="overflow-retry">
+    If the LLM itself returns a context overflow error (detected by `looks_like_overflow`), `_complete` halves `config.context_budget`, forces a compact, and retries once. This is a last-resort fuse. The `on_compact` hook emits a `ContextCompacted` event with `strategy="overflow-retry"` and a `WarningOccurred` so the client can surface the degraded context state.
+  </Step>
+</Steps>
+
+<Warning>
+  Subagents use `CHILD_COMPACT_TRIGGER = 2.0`, which effectively **disables in-loop compaction** for children — the trigger ratio can never be reached. Children instead rely on `compress_for_parent` to summarise their full transcript into an `AgentResult` at the end of the task.
+</Warning>
+
+## Orchestrator vs Subagent
+
+<Tabs>
+  <Tab title="Orchestrator">
+    `Orchestrator` (`agents/orchestrator.py`) extends `AgentLoop` with:
+    - A tool set restricted to **personality-spawn tools** (one per profile) plus `remember` and `settle_worktree`. It has no filesystem tools.
+    - `concurrent_tools=True` so it can emit multiple personality calls in a single turn, launching them as parallel asyncio tasks via `spawn()`.
+    - Git worktree management: writer profiles (coder, tester) get an isolated `workspace/.engine/worktrees/<agent_id>` directory on a fresh branch `engine/<profile>/<agent_id>`. The orchestrator tracks worktrees in `_worktrees` and recovers them on session restart.
+    - A `_pending_settles` queue. When all children finish, `schedule_flush_settles` processes pending worktree settle prompts (merge / PR / keep / discard).
+    - `reset_user_message_spawns()` clears survey-once accounting so the first user message can fan out an `ask` and a `researcher` in parallel, but subsequent inbox turns from child results cannot keep re-spawning the same survey profile.
+  </Tab>
+  <Tab title="Subagent">
+    `Subagent` (`agents/subagent.py`) extends `AgentLoop` with:
+    - The profile's `system_prompt` plus a `REPORT_TO_ORCH` footer that tells the agent how to format its closing briefing.
+    - `freeze_system=True` so the system prompt (including memory and skills) is built once and cached — keeping the cache prefix identical across turns for providers that support prompt caching.
+    - `concurrent_tools=True` with a fresh `asyncio.Lock` for isolated writers so tools within a child run concurrently but file writes are serialised.
+    - A `finish(status)` method that calls `compress_for_parent` to distil the child's full transcript into an `AgentResult` (`status`, `summary`, `outcome`, `files_touched`, `leftover_questions`, `missing_checks`).
+  </Tab>
+</Tabs>
+
+### Worktree isolation for writer agents
+
+When a coder or tester is spawned, `add_agent_worktree` creates a git worktree at `workspace/.engine/worktrees/<agent_id>` on branch `engine/<profile>/<agent_id>`. The child receives `child_workspace = Path(worktree_path)` and a fresh `FileTracker`, so its staleness checks are scoped to its own copy of the files. A reviewer profile sets `join_worktree=True` and is routed into the most recent writer's worktree for the same batch so `git_diff` sees the coder's uncommitted changes.
+
+After the child finishes, `commit_if_dirty` commits any uncommitted edits on the worktree branch. The user is then prompted to merge, open a PR, keep, or discard. The decision is reported as a `WorktreeSettled` event.
+
+## `AgentHooks` callbacks
+
+`AgentHooks` (`agents/hooks.py`) is a plain dataclass of optional callbacks that `EngineSession` populates for every agent:
+
+```python
+# agents/hooks.py
+@dataclass
+class AgentHooks:
+    on_tool: Callable[..., None] | None = None        # tool finished
+    on_tool_start: Callable[...] | None = None        # tool started
+    on_delta: Callable[[str, str, str], None] | None = None   # streaming text chunk
+    on_message_start: Callable[[str], None] | None = None     # new message ID
+    on_message: Callable[[str, str], None] | None = None      # full message (children only)
+    on_usage: Callable[..., None] | None = None       # token/cost accounting
+    on_llm_request: Callable[...] | None = None       # LLM request latency
+    on_state: Callable[[str, int, int], None] | None = None   # state machine transitions
+    on_compact: Callable[[dict], None] | None = None  # compaction info
+```
+
+<Accordion title="Callback reference">
+  | Callback | When called | What `EngineSession` does |
+  |---|---|---|
+  | `on_tool_start(call_id, name, arguments)` | Before `ToolRegistry.execute` | Emits `ToolCallStarted`; updates agent's `current_tool` in the live agent list |
+  | `on_tool(call_id, name, arguments, result, reasoning)` | After `ToolRegistry.execute` | Emits `ToolCallFinished` with 400-char preview; clears `current_tool`; writes trace line if `ENGINE_TRACE_CALLS=true` |
+  | `on_delta(message_id, channel, text)` | Each streaming chunk from the LLM | Emits `ChatMessageStarted` (once, on first `text`-channel chunk) then `ChatMessageDelta` |
+  | `on_message_start(message_id)` | Before streaming begins | Stores the orchestrator's `_stream_id` so the later `ChatMessageAdded` reuses the same ID |
+  | `on_message(message_id, text)` | When a **child** assistant message is complete | Emits `ChatMessageAdded` with `agent_id` set; never called for the orchestrator |
+  | `on_usage(usage, model)` | After each LLM call with usage metadata | Accumulates token/cost counters in `SessionState.stats`; emits `StatsUpdated` |
+  | `on_llm_request(model, duration_s, failed)` | After each LLM call | Observes latency / failure metrics if a Prometheus push gateway is configured |
+  | `on_state(state, turn, max_turns)` | On every state transition | Emits `AgentStateChanged`; valid states: `idle`, `thinking`, `calling_tool`, `waiting_for_user`, `aborting`, `compacting` |
+  | `on_compact(info)` | After `compact()` returns | Emits `ContextCompacted` with strategy, message counts, chars saved, and summary snippet |
+</Accordion>
+
+<Tip>
+  The `on_message` hook is only wired for children (`agent_id != ""`). The orchestrator's finished text is captured by `session._run_turn` directly from `run()`'s return value, not through this hook.
+</Tip>

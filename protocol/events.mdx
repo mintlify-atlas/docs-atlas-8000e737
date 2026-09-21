@@ -1,0 +1,467 @@
+---
+title: "Protocol Events: Engine-to-Client Messages"
+sidebarTitle: "Events"
+description: "Complete reference for all engine-to-client events — when each fires, every field it carries, and how groups of events combine to represent chat, agents, files, and session state."
+---
+
+Events are the engine's half of the CodeLoom wire protocol. The engine emits them on the write side of every connected client's socket as newline-delimited JSON objects. Every event carries a `type` field matching its Python dataclass name; optional fields are omitted when `None` or empty. Events fan out to all connected clients simultaneously — every subscriber sees the same stream.
+
+<Info>
+  All events are `@dataclass` instances registered via the `@event` decorator in `protocol/events.py`. Fields with a default of `""` or `[]` are optional on the wire; absent fields deserialise to their defaults.
+</Info>
+
+---
+
+## Chat
+
+### `ChatMessageAdded`
+
+Emitted when a new, complete chat message is committed to the session history. This is the canonical record — `ChatMessageDelta` chunks are previews only.
+
+<ResponseField name="type" type='"ChatMessageAdded"' required />
+<ResponseField name="id" type="string" required>
+  Unique message ID (UUID).
+</ResponseField>
+<ResponseField name="role" type="string" required>
+  One of `user`, `assistant`, `engine` (subagent result posted back to the
+  orchestrator), or `tool` (tool-call preview, truncated to 400 chars).
+</ResponseField>
+<ResponseField name="text" type="string" required>
+  The full message text.
+</ResponseField>
+<ResponseField name="ts" type="string" required>
+  ISO-8601 UTC timestamp.
+</ResponseField>
+<ResponseField name="agent_id" type="string">
+  Set for child agent messages. Empty string means the orchestrator.
+  Child `assistant` lines with `agent_id` set are **not** stored in the
+  orchestrator's persisted history.
+</ResponseField>
+
+---
+
+### `ChatHistoryAdded`
+
+One replayed historical message, emitted during a snapshot replay (`RequestSnapshot` with `replay=true`) or `RequestAgentTranscript`. Identical to `ChatMessageAdded` but includes pagination counters so the client can show progress.
+
+<ResponseField name="type" type='"ChatHistoryAdded"' required />
+<ResponseField name="id" type="string" required>Unique message ID.</ResponseField>
+<ResponseField name="role" type="string" required>Same values as `ChatMessageAdded.role`.</ResponseField>
+<ResponseField name="text" type="string" required>Full message text.</ResponseField>
+<ResponseField name="ts" type="string" required>ISO-8601 UTC timestamp.</ResponseField>
+<ResponseField name="index" type="integer" required>0-based position of this message in the replay sequence.</ResponseField>
+<ResponseField name="total" type="integer" required>Total number of messages in the replay sequence.</ResponseField>
+<ResponseField name="agent_id" type="string">Set for child agent messages; empty for orchestrator.</ResponseField>
+
+---
+
+### `ChatHistoryComplete`
+
+Signals the end of a `ChatHistoryAdded` replay sequence.
+
+<ResponseField name="type" type='"ChatHistoryComplete"' required />
+<ResponseField name="count" type="integer" required>Total number of messages that were replayed.</ResponseField>
+<ResponseField name="agent_id" type="string">The agent whose transcript was replayed; empty for orchestrator.</ResponseField>
+
+---
+
+### `ChatMessageStarted`
+
+Emitted just before an assistant message begins streaming. Lets the client create a placeholder before any `ChatMessageDelta` chunks arrive.
+
+<ResponseField name="type" type='"ChatMessageStarted"' required />
+<ResponseField name="id" type="string" required>Message ID that subsequent `ChatMessageDelta` events will share.</ResponseField>
+<ResponseField name="role" type="string" required>Always `assistant`.</ResponseField>
+<ResponseField name="ts" type="string" required>ISO-8601 UTC timestamp.</ResponseField>
+<ResponseField name="agent_id" type="string">Empty string means the orchestrator; set for a subagent.</ResponseField>
+
+---
+
+### `ChatMessageDelta`
+
+An incremental text chunk from a streaming assistant reply. Multiple deltas share the same `id`. The final `ChatMessageAdded` with the same `id` is the canonical record.
+
+<ResponseField name="type" type='"ChatMessageDelta"' required />
+<ResponseField name="id" type="string" required>ID of the message being streamed (matches the preceding `ChatMessageStarted.id`).</ResponseField>
+<ResponseField name="channel" type="string" required>
+  Identifies the stream: `"text"` for visible response text, `"reasoning"` for
+  chain-of-thought reasoning tokens (if the model exposes them).
+</ResponseField>
+<ResponseField name="text" type="string" required>The incremental text chunk.</ResponseField>
+<ResponseField name="agent_id" type="string">Empty string for orchestrator; set for a subagent.</ResponseField>
+
+---
+
+## Agent lifecycle
+
+### `AgentStarted`
+
+Emitted when a subagent is spawned by the orchestrator.
+
+<ResponseField name="type" type='"AgentStarted"' required />
+<ResponseField name="agent_id" type="string" required>Unique agent UUID.</ResponseField>
+<ResponseField name="profile" type="string" required>Personality name (e.g. `coder`, `tester`, `reviewer`, `ask`, `researcher`, `debugger`).</ResponseField>
+<ResponseField name="parent_id" type="string" required>Agent ID of the spawning orchestrator.</ResponseField>
+<ResponseField name="task" type="string" required>Natural-language description of the task assigned to this agent.</ResponseField>
+<ResponseField name="worktree" type="string">Absolute path to the git worktree for writer agents (`coder`, `tester`). Empty for read-only agents.</ResponseField>
+<ResponseField name="branch" type="string">Git branch name inside the worktree (e.g. `engine/coder/abc123`).</ResponseField>
+<ResponseField name="batch_id" type="string">Groups agents spawned in the same orchestrator reply.</ResponseField>
+<ResponseField name="batch_name" type="string">Human-readable nickname derived from the user message for this batch.</ResponseField>
+
+---
+
+### `AgentFinished`
+
+Emitted when a subagent completes its task and returns a result to the orchestrator.
+
+<ResponseField name="type" type='"AgentFinished"' required />
+<ResponseField name="agent_id" type="string" required>Agent UUID.</ResponseField>
+<ResponseField name="profile" type="string" required>Personality name.</ResponseField>
+<ResponseField name="status" type="string" required>Outcome: `ok`, `failed`, `aborted`, or `incomplete`.</ResponseField>
+<ResponseField name="summary" type="string" required>Compressed result text (up to 400 chars) posted back to the orchestrator.</ResponseField>
+<ResponseField name="cost" type="number">Total LLM cost in USD for this agent's run.</ResponseField>
+<ResponseField name="prompt_tokens" type="integer">Prompt tokens consumed.</ResponseField>
+<ResponseField name="cached_tokens" type="integer">Cached prompt tokens (not billed).</ResponseField>
+<ResponseField name="total_tokens" type="integer">Total tokens (prompt + completion).</ResponseField>
+<ResponseField name="requests" type="integer">Number of LLM API requests made.</ResponseField>
+
+---
+
+### `AgentsUpdated`
+
+Emitted after any agent starts, finishes, or changes status or tool. Provides the complete current list of live agents so the client can replace its agent panel in one update.
+
+<ResponseField name="type" type='"AgentsUpdated"' required />
+<ResponseField name="agents" type="AgentRow[]" required>
+  Full list of active agents. See [AgentRow](/protocol/snapshot#agentrow) for field details.
+</ResponseField>
+
+---
+
+### `AgentStateChanged`
+
+Emitted whenever an agent transitions between processing states.
+
+<ResponseField name="type" type='"AgentStateChanged"' required />
+<ResponseField name="state" type="string" required>
+  One of: `idle`, `thinking`, `calling_tool`, `waiting_for_user`,
+  `aborting`, `compacting`.
+</ResponseField>
+<ResponseField name="turn" type="integer" required>Current turn number (1-based).</ResponseField>
+<ResponseField name="max_turns" type="integer" required>Turn cap for this agent before a continue/handoff/stop checkpoint.</ResponseField>
+<ResponseField name="agent_id" type="string">Empty string for the orchestrator; set for a subagent.</ResponseField>
+
+<Note>
+  `waiting_for_user` means **this** agent's prompt is on screen. A different
+  agent still in its tool call shows `calling_tool` even if it is internally
+  queued on the `PromptBroker`.
+</Note>
+
+---
+
+## Tool execution
+
+### `ToolCallStarted`
+
+Emitted when an agent invokes a tool. Paired with a later `ToolCallFinished`.
+
+<ResponseField name="type" type='"ToolCallStarted"' required />
+<ResponseField name="call_id" type="string" required>Unique call ID (matches the LLM's tool-call ID).</ResponseField>
+<ResponseField name="name" type="string" required>Tool name (e.g. `str_replace`, `read_file`, `run_command`).</ResponseField>
+<ResponseField name="arguments_json" type="string" required>Raw JSON string of the tool arguments as supplied by the model.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent that made the call; empty for orchestrator.</ResponseField>
+
+---
+
+### `ToolCallFinished`
+
+Emitted when a tool call completes, whether successfully or not.
+
+<ResponseField name="type" type='"ToolCallFinished"' required />
+<ResponseField name="call_id" type="string" required>Matches the `call_id` from `ToolCallStarted`.</ResponseField>
+<ResponseField name="name" type="string" required>Tool name.</ResponseField>
+<ResponseField name="preview" type="string" required>Truncated result text (up to 400 chars). The full result is sent to the model but is not broadcast on the wire.</ResponseField>
+<ResponseField name="ok" type="boolean" required>`true` if the tool returned a non-error result; `false` if the result starts with `error:`.</ResponseField>
+<ResponseField name="duration_ms" type="integer" required>Wall-clock time the tool took to execute, in milliseconds.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent that made the call; empty for orchestrator.</ResponseField>
+
+---
+
+### `CommandOutputChunk`
+
+Live stdout/stderr from a `run_command` tool call, streamed incrementally as the subprocess produces output. The final `ToolCallFinished` signals completion.
+
+<ResponseField name="type" type='"CommandOutputChunk"' required />
+<ResponseField name="call_id" type="string" required>Matches the `call_id` of the enclosing `ToolCallStarted`.</ResponseField>
+<ResponseField name="stream" type="string" required>`"stdout"` or `"stderr"`.</ResponseField>
+<ResponseField name="text" type="string" required>The output chunk text.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent running the command; empty for orchestrator.</ResponseField>
+
+---
+
+## File and git
+
+### `FileContent`
+
+Full text content of an open file. Emitted in response to `OpenFile`, during snapshot replay, and when an externally-changed file is re-read.
+
+<ResponseField name="type" type='"FileContent"' required />
+<ResponseField name="path" type="string" required>Workspace-relative file path.</ResponseField>
+<ResponseField name="content" type="string" required>Complete file text.</ResponseField>
+
+---
+
+### `FileEdited`
+
+An agent edit has landed on disk. Emitted after every successful write-funnel commit.
+
+<ResponseField name="type" type='"FileEdited"' required />
+<ResponseField name="path" type="string" required>Workspace-relative path of the edited file.</ResponseField>
+<ResponseField name="diff" type="string" required>Unified diff of the change (clipped to 4,000 chars in the event; full diff is in the edit journal).</ResponseField>
+<ResponseField name="tool" type="string" required>Name of the tool that produced the edit (e.g. `str_replace`, `replace_lines`, `rename_symbol`).</ResponseField>
+<ResponseField name="edit_id" type="string" required>Batch ID grouping related edits (e.g. a multi-file rename is one batch).</ResponseField>
+
+---
+
+### `FileClosed`
+
+A file has been removed from the open-file set.
+
+<ResponseField name="type" type='"FileClosed"' required />
+<ResponseField name="path" type="string" required>Workspace-relative path of the closed file.</ResponseField>
+
+---
+
+### `FileTreeUpdated`
+
+Emitted after the workspace file tree changes (snapshot ready, `CreatePath`, `DeletePath`, undo). Contains the full current tree so the client can replace its file-browser state.
+
+<ResponseField name="type" type='"FileTreeUpdated"' required />
+<ResponseField name="file_tree" type="FileTreeNode[]" required>
+  Recursive tree of nodes. See [FileTreeNode](/protocol/snapshot#filetreenode).
+</ResponseField>
+
+---
+
+### `GitStateUpdated`
+
+Emitted in response to `RequestGit` and after write operations that affect the git index.
+
+<ResponseField name="type" type='"GitStateUpdated"' required />
+<ResponseField name="git" type="GitState" required>
+  Full git state. See [GitState](/protocol/snapshot#gitstate).
+</ResponseField>
+
+---
+
+### `PathChanged`
+
+Emitted when a file or directory is created, renamed, or deleted via a protocol command.
+
+<ResponseField name="type" type='"PathChanged"' required />
+<ResponseField name="path" type="string" required>Workspace-relative path that changed.</ResponseField>
+<ResponseField name="action" type="string" required>One of `created`, `renamed`, `deleted`.</ResponseField>
+<ResponseField name="dest" type="string">For `renamed` actions, the new workspace-relative destination path.</ResponseField>
+
+---
+
+## Session state
+
+### `SnapshotReady`
+
+Carries the full `EngineSnapshot` — the primary reconnect/handshake response. Emitted after `StartSession` and in response to `RequestSnapshot`.
+
+The snapshot's `messages` array is **always empty** in this event; history is streamed separately as `ChatHistoryAdded` events to avoid blocking the event loop on a large history load.
+
+<ResponseField name="type" type='"SnapshotReady"' required />
+<ResponseField name="snapshot" type="EngineSnapshot" required>
+  Full session state. See [EngineSnapshot](/protocol/snapshot) for all fields.
+</ResponseField>
+
+---
+
+### `SessionList`
+
+Response to `ListSessions`. Contains summaries of all persisted sessions.
+
+<ResponseField name="type" type='"SessionList"' required />
+<ResponseField name="sessions" type="SessionSummary[]" required>
+  Ordered most-recently-saved first. See [SessionSummary](/protocol/snapshot#sessionsummary).
+</ResponseField>
+
+---
+
+### `SessionEnded`
+
+Emitted when the session is closed, either by `Shutdown` or by a fatal internal error.
+
+<ResponseField name="type" type='"SessionEnded"' required />
+<ResponseField name="reason" type="string" required>Human-readable reason for the session ending.</ResponseField>
+
+---
+
+### `StatsUpdated`
+
+Emitted after every LLM request completes, updating cumulative usage counters.
+
+<ResponseField name="type" type='"StatsUpdated"' required />
+<ResponseField name="stats" type="Stats" required>
+  Cumulative token and cost counters. See [Stats](/protocol/snapshot#stats).
+</ResponseField>
+
+---
+
+## Interaction
+
+### `UserPromptRequested`
+
+The engine is blocked waiting for a user decision — command approval, worktree settle, or a question from an agent. Send `AnswerPrompt` with the matching `prompt_id` to unblock it.
+
+<ResponseField name="type" type='"UserPromptRequested"' required />
+<ResponseField name="prompt_id" type="string" required>Unique prompt ID. Pass this back in `AnswerPrompt`.</ResponseField>
+<ResponseField name="question" type="string" required>The question or description shown to the user.</ResponseField>
+<ResponseField name="kind" type="string" required>
+  Interaction style: `"text"` for free-form input, `"choice"` for one of the
+  listed options.
+</ResponseField>
+<ResponseField name="choices" type="string[]" required>Valid answer strings for `"choice"` kind prompts. Empty for `"text"` kind.</ResponseField>
+<ResponseField name="default" type="string">Pre-selected answer if the user accepts without typing.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent waiting for the answer; empty for orchestrator-level prompts.</ResponseField>
+
+---
+
+### `ErrorOccurred`
+
+A recoverable error. The engine never terminates the connection on an `ErrorOccurred` — it is always safe to keep sending commands. Sources include malformed commands, tool failures, oversized events (dropped with an explanation), and internal exceptions.
+
+<ResponseField name="type" type='"ErrorOccurred"' required />
+<ResponseField name="message" type="string" required>Human-readable error description.</ResponseField>
+
+---
+
+### `WarningOccurred`
+
+An advisory notice that does not prevent operation. Common uses: unsupported project language, a missing optional dependency, an MCP server that failed to start.
+
+<ResponseField name="type" type='"WarningOccurred"' required />
+<ResponseField name="message" type="string" required>Human-readable warning text.</ResponseField>
+
+---
+
+## Compaction
+
+### `ContextCompacted`
+
+Emitted when an agent's context window is trimmed or summarised to stay within the token budget.
+
+<ResponseField name="type" type='"ContextCompacted"' required />
+<ResponseField name="strategy" type="string" required>Compaction method used (e.g. `"trim"`, `"summarise"`).</ResponseField>
+<ResponseField name="messages_before" type="integer" required>Number of messages in history before compaction.</ResponseField>
+<ResponseField name="messages_after" type="integer" required>Number of messages retained after compaction.</ResponseField>
+<ResponseField name="chars_saved" type="integer" required>Approximate character count removed.</ResponseField>
+<ResponseField name="summary" type="string" required>Text of the generated summary injected in place of the dropped messages.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent whose context was compacted; empty for orchestrator.</ResponseField>
+
+---
+
+## Integrations
+
+### `McpServersUpdated`
+
+Emitted after `ReloadIntegrations` or when MCP server status changes. Replaces the client's full MCP server list.
+
+<ResponseField name="type" type='"McpServersUpdated"' required />
+<ResponseField name="servers" type="McpServerRow[]" required>
+  Full list of configured servers. See [McpServerRow](/protocol/snapshot#mcpserverrow).
+</ResponseField>
+
+---
+
+### `SkillCatalogUpdated`
+
+Emitted after `ReloadIntegrations` or on session start. Replaces the full skill catalog.
+
+<ResponseField name="type" type='"SkillCatalogUpdated"' required />
+<ResponseField name="skills" type="SkillRow[]" required>
+  All discovered skills. See [SkillRow](/protocol/snapshot#skillrow).
+</ResponseField>
+
+---
+
+### `SkillActivated`
+
+Emitted when a skill is successfully loaded into a session, either via `ActivateSkill` or automatically by an agent.
+
+<ResponseField name="type" type='"SkillActivated"' required />
+<ResponseField name="name" type="string" required>The skill name that was activated.</ResponseField>
+<ResponseField name="agent_id" type="string">Agent that activated the skill; empty for session-level activation.</ResponseField>
+
+---
+
+### `McpAuthRequired`
+
+The engine needs an OAuth token or credential to connect to an MCP server. Send `CompleteMcpAuth` with a token to unblock it.
+
+<ResponseField name="type" type='"McpAuthRequired"' required />
+<ResponseField name="server" type="string" required>MCP server name requesting authentication.</ResponseField>
+<ResponseField name="url" type="string">Auth URL the user should visit (for OAuth flows).</ResponseField>
+<ResponseField name="prompt_id" type="string">If set, a `UserPromptRequested` with this ID was also emitted — the user's answer via `AnswerPrompt` will complete authentication.</ResponseField>
+
+---
+
+## Context and memory
+
+### `OrchContext`
+
+Response to `RequestOrchContext`. Contains the orchestrator's assembled model context.
+
+<ResponseField name="type" type='"OrchContext"' required />
+<ResponseField name="text" type="string" required>Full context string — system prompt, notes, and message history concatenated as the model would receive them.</ResponseField>
+
+---
+
+### `ContextBreakdown`
+
+Response to `RequestContext`. Itemises every named section in an agent's context window.
+
+<ResponseField name="type" type='"ContextBreakdown"' required />
+<ResponseField name="agent_id" type="string">Agent whose context is described; empty for orchestrator.</ResponseField>
+<ResponseField name="budget" type="integer">Token budget for this agent.</ResponseField>
+<ResponseField name="prompt_tokens" type="integer">Current estimated prompt token count.</ResponseField>
+<ResponseField name="compacted" type="boolean">Whether a compaction has already occurred in this session.</ResponseField>
+<ResponseField name="sections" type="ContextSection[]">
+  Named sections (system prompt, memory, open files, history, etc.). See [ContextSection](/protocol/snapshot#contextsection).
+</ResponseField>
+
+---
+
+### `MemoryUpdated`
+
+Emitted when workspace memory changes, or in response to `RequestMemory`. Contains the full current memory state.
+
+<ResponseField name="type" type='"MemoryUpdated"' required />
+<ResponseField name="files" type="MemoryFileNote[]">File notes — purpose, entry points, constraints, staleness. See [MemoryFileNote](/protocol/snapshot#memoryfilenote).</ResponseField>
+<ResponseField name="engineering" type="MemoryDecision[]">Engineering decisions. See [MemoryDecision](/protocol/snapshot#memorydecision).</ResponseField>
+<ResponseField name="product" type="MemoryDecision[]">Product decisions.</ResponseField>
+<ResponseField name="cicd" type="MemoryDecision[]">CI/CD decisions.</ResponseField>
+<ResponseField name="other" type="MemoryDecision[]">Uncategorised decisions.</ResponseField>
+
+---
+
+## Worktrees
+
+### `WorktreeSettled`
+
+Emitted after the user answers a worktree-settle prompt (merge, open PR, keep, discard) for a writer agent's branch.
+
+<ResponseField name="type" type='"WorktreeSettled"' required />
+<ResponseField name="agent_id" type="string" required>The writer agent whose worktree was settled.</ResponseField>
+<ResponseField name="profile" type="string" required>Agent personality (e.g. `coder`, `tester`).</ResponseField>
+<ResponseField name="action" type="string" required>The action taken: `merged`, `pr`, `kept`, or `discarded`.</ResponseField>
+<ResponseField name="detail" type="string" required>Human-readable description of what happened.</ResponseField>
+<ResponseField name="branch" type="string" required>The worktree branch name.</ResponseField>
+<ResponseField name="pr_url" type="string">URL of the opened pull request, if `action` is `pr`.</ResponseField>
+<ResponseField name="ok" type="boolean">
+  `true` on success; `false` if the settle action encountered an error (in which
+  case `detail` explains why).
+</ResponseField>

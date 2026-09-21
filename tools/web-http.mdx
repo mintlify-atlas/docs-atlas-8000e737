@@ -1,0 +1,346 @@
+---
+title: "Web and HTTP Tools: Search, Fetch, and Call APIs"
+sidebarTitle: "Web & HTTP"
+description: "Ten tools covering Brave web search, HTML-to-markdown fetch, typed HTTP requests, OpenAPI exploration, official docs lookup, vulnerability scanning, and runtime info."
+---
+
+The web and HTTP tools let agents reach external information sources without leaving the engine. All network tools enforce scheme restrictions (`http`/`https` only) and block cloud-metadata endpoints. Mutating HTTP methods require approval; `GET` and `HEAD` are free.
+
+<CardGroup cols={2}>
+  <Card title="web_search" icon="magnifying-glass">
+    Brave Search API — returns ranked results with snippets.
+  </Card>
+  <Card title="web_fetch" icon="globe">
+    HTTP GET with HTML-to-markdown conversion. GitHub URLs blocked.
+  </Card>
+  <Card title="http_request" icon="arrow-right-arrow-left">
+    Typed HTTP client. POST/PUT/PATCH/DELETE gated by approval.
+  </Card>
+  <Card title="openapi_ops" icon="book-open">
+    List operations from an OpenAPI/Swagger document URL.
+  </Card>
+  <Card title="docs_lookup" icon="book">
+    Official docs for mdn, pypi, npm, crates, go.
+  </Card>
+  <Card title="tldr" icon="circle-info">
+    Cheat-sheet pages for CLI commands.
+  </Card>
+  <Card title="dep_why" icon="diagram-project">
+    Explain why a package is in the dependency tree.
+  </Card>
+  <Card title="pkg_info" icon="box">
+    Public registry metadata for any ecosystem.
+  </Card>
+  <Card title="osv_query" icon="shield-exclamation">
+    OSV.dev vulnerability lookup by package and version.
+  </Card>
+  <Card title="runtime_info" icon="microchip">
+    Local versions of python, node, go, git, gh, and rg.
+  </Card>
+</CardGroup>
+
+---
+
+## `web_search`
+
+```python
+web_search(query: str, count: int = 5) -> str
+```
+
+Performs a web search using the [Brave Search API](https://brave.com/search/api/) and returns ranked results with titles, URLs, descriptions, and extra snippets.
+
+### Parameters
+
+<ParamField path="query" type="str" required>
+  The search query string.
+</ParamField>
+
+<ParamField path="count" type="int" default="5">
+  Number of results to return. Clamped to `[1, 10]`.
+</ParamField>
+
+### Return value
+
+```
+[1] Python asyncio — official docs
+url: https://docs.python.org/3/library/asyncio.html
+The asyncio library provides infrastructure for writing single-threaded concurrent code using coroutines.
+```
+
+Returns `error: web_search unavailable (set BRAVE_API_KEY); pass a URL to web_fetch instead` when `BRAVE_API_KEY` is not set in the environment.
+
+<Warning>
+`BRAVE_API_KEY` must be set as an environment variable before starting the engine. Without it, `web_search` always returns an error. Use `web_fetch` with a known URL as a fallback.
+</Warning>
+
+---
+
+## `web_fetch`
+
+```python
+web_fetch(url: str) -> str
+```
+
+Issues an HTTP GET request to `url` and converts HTML responses to readable markdown (stripping scripts, navigation, footers, and forms). JSON and plain-text responses are returned as-is, capped at 20,000 characters (`MARKDOWN_CAP`).
+
+### Parameters
+
+<ParamField path="url" type="str" required>
+  `http` or `https` URL. No other schemes are accepted.
+</ParamField>
+
+### Return value
+
+```
+title: Python asyncio — docs
+url: https://docs.python.org/3/library/asyncio.html
+
+## asyncio — Asynchronous I/O
+
+...
+```
+
+### GitHub URL restriction
+
+`web_fetch` refuses any URL on `github.com` and returns a redirect hint instead:
+
+```
+error: use github_repo / github_tree / github_file for owner/repo.
+ github_file repo=owner/repo path=src/main.py ref=main. Do not web_fetch github.com HTML.
+```
+
+Use `github_file`, `github_tree`, or `github_repo` for all GitHub content.
+
+<Tip>
+If the page appears client-rendered (large HTML but minimal extracted text), the tool returns an error suggesting `browser_open` as an alternative.
+</Tip>
+
+---
+
+## `http_request`
+
+```python
+async http_request(ctx: ToolContext, method: str, url: str, headers: str = "", body: str = "", timeout: int = 20) -> str
+```
+
+Makes a typed HTTP request. `GET` and `HEAD` execute without approval. `POST`, `PUT`, `PATCH`, and `DELETE` trigger the approval flow.
+
+### Parameters
+
+<ParamField path="method" type="str" required>
+  HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, or `DELETE`.
+</ParamField>
+
+<ParamField path="url" type="str" required>
+  `http` or `https` URL. Cloud-metadata IPs are blocked (see below).
+</ParamField>
+
+<ParamField path="headers" type="str" default='""'>
+  Optional request headers. Accepts either a JSON object (`{"Authorization": "Bearer …"}`) or `Header: Value` lines, one per line.
+</ParamField>
+
+<ParamField path="body" type="str" default='""'>
+  Optional request body as a string. Encoded as UTF-8.
+</ParamField>
+
+<ParamField path="timeout" type="int" default="20">
+  Timeout in seconds.
+</ParamField>
+
+### Return value
+
+```
+status: 200
+content-type: application/json
+
+{"id": 42, "name": "example"}
+```
+
+Response body capped at 50,000 characters (`BODY_CAP`). Interesting response headers (`content-type`, `location`, `x-request-id`, `allow`) are included above the body.
+
+### Blocked hosts
+
+The following hosts and IP ranges are unconditionally blocked:
+
+- `metadata.google.internal`, `metadata.gce.internal`
+- `169.254.169.254` (AWS/Azure instance metadata)
+- Any link-local, multicast, unspecified, or reserved IP address
+
+Loopback addresses (`127.0.0.1`, `::1`) are **not** blocked.
+
+---
+
+## `openapi_ops`
+
+```python
+openapi_ops(url: str) -> str
+```
+
+Fetches an OpenAPI 2.x/3.x (JSON or YAML) document from `url` and lists all HTTP operations as `METHOD /path — summary`.
+
+### Parameters
+
+<ParamField path="url" type="str" required>
+  `http` or `https` URL of a Swagger or OpenAPI specification document.
+</ParamField>
+
+### Return value
+
+```
+GET /users — List users
+POST /users — Create a user
+GET /users/{id} — Get user by id
+DELETE /users/{id} — Delete user
+```
+
+Capped at 80 operations (`OPENAPI_CAP`). Returns `...[truncated]` when the spec has more operations.
+
+---
+
+## `docs_lookup`
+
+```python
+docs_lookup(source: str, query: str) -> str
+```
+
+Looks up official documentation from one of five curated sources. Prefer this over `web_search` for API facts — the sources are authoritative and the results are pre-filtered.
+
+### Parameters
+
+<ParamField path="source" type="str" required>
+  One of: `mdn`, `pypi`, `npm`, `crates`, `go`.
+</ParamField>
+
+<ParamField path="query" type="str" required>
+  Search query, package name, or module path.
+</ParamField>
+
+### Sources
+
+| Source | Coverage |
+|---|---|
+| `mdn` | MDN Web Docs (HTML, CSS, JavaScript, Web APIs) |
+| `pypi` | PyPI package metadata and README |
+| `npm` | npm registry metadata and README |
+| `crates` | crates.io Rust package metadata |
+| `go` | pkg.go.dev Go module documentation |
+
+---
+
+## `tldr`
+
+```python
+tldr(topic: str) -> str
+```
+
+Fetches the [tldr-pages](https://tldr.sh) cheat sheet for a CLI command, showing common usage patterns with flags and brief descriptions.
+
+### Parameters
+
+<ParamField path="topic" type="str" required>
+  Command name, e.g. `pytest`, `git`, `rg`, `docker`.
+</ParamField>
+
+### Return value
+
+A condensed cheat sheet with common invocations. Returns an error when no tldr page exists for the topic.
+
+---
+
+## `dep_why`
+
+```python
+dep_why(ctx: ToolContext, ecosystem: str, name: str) -> str
+```
+
+Explains why a package is present in the project's dependency tree by running the ecosystem's native dependency analysis command.
+
+### Parameters
+
+<ParamField path="ecosystem" type="str" required>
+  One of: `npm`, `go`, `pypi`, `crates`.
+</ParamField>
+
+<ParamField path="name" type="str" required>
+  Package or module name to trace.
+</ParamField>
+
+### Backend commands
+
+| Ecosystem | Command |
+|---|---|
+| `npm` | `npm ls <name>` |
+| `go` | `go mod why <name>` |
+| `pypi` | `pip show <name>` |
+| `crates` | `cargo tree -i <name>` |
+
+---
+
+## `pkg_info`
+
+```python
+pkg_info(ecosystem: str, name: str) -> str
+```
+
+Fetches metadata for a package from its public registry — version, description, homepage, license, dependencies. Does not download or install anything.
+
+### Parameters
+
+<ParamField path="ecosystem" type="str" required>
+  One of: `pypi`, `npm`, `crates`, `go`, `maven`, `nuget`, `rubygems`.
+</ParamField>
+
+<ParamField path="name" type="str" required>
+  Package name. For Maven, use `group:artifact` format.
+</ParamField>
+
+---
+
+## `osv_query`
+
+```python
+osv_query(ecosystem: str, package: str, version: str = "") -> str
+```
+
+Queries [OSV.dev](https://osv.dev) for known security advisories affecting a package. When `version` is empty, the query returns advisories for any version of the package.
+
+### Parameters
+
+<ParamField path="ecosystem" type="str" required>
+  One of: `pypi`, `npm`, `crates`, `go`, `maven`, `nuget`, `rubygems`.
+</ParamField>
+
+<ParamField path="package" type="str" required>
+  Package name.
+</ParamField>
+
+<ParamField path="version" type="str" default='""'>
+  Specific version string (e.g. `2.1.0`). When empty, lists all advisories for the package.
+</ParamField>
+
+### Return value
+
+A formatted list of OSV advisory IDs, aliases (CVEs), severity, and affected version ranges. Returns `(no vulnerabilities found)` for clean packages.
+
+---
+
+## `runtime_info`
+
+```python
+runtime_info() -> str
+```
+
+Reports the versions of locally installed tools. Takes no parameters.
+
+### Return value
+
+```
+python: 3.12.2
+node: 20.11.0
+go: 1.22.1
+git: 2.44.0
+gh: 2.45.0
+rg: 14.1.0
+```
+
+Missing tools are omitted. Use this before running language-specific commands to confirm the right runtime is available.

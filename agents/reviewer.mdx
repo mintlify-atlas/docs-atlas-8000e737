@@ -1,0 +1,137 @@
+---
+title: "Reviewer Agent: Code Review in a Writer's Worktree"
+sidebarTitle: "Reviewer"
+description: "The reviewer profile joins an existing writer's git worktree to inspect the real diff with sitter and LSP, then returns a specific approve, request-changes, or block verdict — never editing files."
+---
+
+After a coder or tester finishes, the orchestrator can spawn a **reviewer** to inspect the diff before the user decides what to do with the worktree. Reviewer is the only profile that uses `join_worktree=True` — it joins the writer's existing git checkout rather than creating its own. It has full LSP and tree-sitter access to read the changed code in context, but it cannot edit files or run shell commands. It returns a verdict with paths and specific findings, not a rubber stamp.
+
+## Purpose
+
+Reviewer reads a writer's diff and produces a verdict: **approve**, **request changes**, or **block**. It starts from `git_status` and `git_diff` to see exactly what changed, reads the affected files with sitter and LSP, and cites specific paths and lines in its verdict. It does not implement fixes — if it requests changes, the orchestrator spawns a new coder (or routes `continue_from` into the same worktree) to apply them.
+
+## Tool allowlist
+
+```python title="agents/profiles/reviewer.py"
+tool_names = NAV + SITTER + LSP + GIT + GH_READ + SCAN + SKILLS + MEMORY
+```
+
+<AccordionGroup>
+  <Accordion title="NAV — filesystem navigation">
+    `list_files`, `read_file`, `search`
+  </Accordion>
+  <Accordion title="SITTER — tree-sitter AST queries">
+    `list_symbols`, `find_symbol`, `get_node_at`, `query_tree`, `parse_file`
+  </Accordion>
+  <Accordion title="LSP — language server protocol">
+    `goto_definition`, `find_references`, `hover`, `get_diagnostics`, `document_symbols`
+  </Accordion>
+  <Accordion title="GIT — diff and history">
+    `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_range`
+  </Accordion>
+  <Accordion title="GH_READ — GitHub PR, issue, and CI reads">
+    All `GH_SOCIAL` tools (`gh_pr_list`, `gh_pr_view`, `gh_pr_comments`, `gh_pr_checks`, `gh_issue_list`, `gh_issue_view`, `gh_run_list`, `gh_run_view`, `gh_release_list`, `gh_release_view`) plus all `GH_REPO` tools (`github_compare`, `github_search_code`, `github_file`, `github_repo`, `github_tree`)
+  </Accordion>
+  <Accordion title="SCAN — TODO markers">
+    `todo_scan` — scoped to the files that actually changed, not the whole repo
+  </Accordion>
+  <Accordion title="SKILLS + MEMORY — knowledge base">
+    `activate_skill`, `read_skill`, `remember`
+  </Accordion>
+</AccordionGroup>
+
+## Profile configuration
+
+```python title="agents/profiles/reviewer.py"
+PROFILE = AgentProfile(
+    name="reviewer",
+    description=(
+        "Read-only review of a writer's git worktree (or the current diff). "
+        "Cannot edit files or run commands."
+    ),
+    system_prompt=REVIEWER_SYSTEM,
+    tool_names=NAV + SITTER + LSP + GIT + GH_READ + SCAN + SKILLS + MEMORY,
+    write_globs=[],      # strictly read-only; no file edits
+    required_tools=[],
+    max_turns=32,
+    join_worktree=True,  # joins the writer's worktree, does not create one
+)
+```
+
+`write_globs=[]` — reviewer cannot create, modify, or delete any file. `join_worktree=True` is what distinguishes it from all other profiles.
+
+## join\_worktree: how the reviewer finds the diff
+
+When `join_worktree=True`, the orchestrator calls `_worktree_to_join(batch_id)` to locate the most recent open writer worktree in the same batch. The reviewer's `workspace` is set to that worktree directory — the same path the writer was operating in. This means:
+
+- `git_status` and `git_diff` show the writer's staged and unstaged changes relative to the worktree's base branch.
+- `git_range` compares the worktree's `HEAD` to the base commit to see everything that was committed.
+- `read_file` reads the files as the writer left them, not as they are in the main checkout.
+
+<Note>
+  If no open writer worktree exists in the batch, the reviewer falls back to the main workspace. In that case `git_diff` shows the current checkout's unstaged changes, which may be the user's own work rather than a coder's output.
+</Note>
+
+## Review workflow
+
+<Steps>
+  <Step title="Start with the diff">
+    Call `git_status` and `git_diff` immediately. For a GitHub PR, use `gh_pr_view`, `gh_pr_comments`, and `gh_pr_checks` instead of or in addition to the local diff.
+  </Step>
+  <Step title="Read the changed files">
+    Use `read_file` on the changed paths. Use `list_symbols` and `find_symbol` for structural inspection. Use LSP (`goto_definition`, `find_references`, `hover`) to check call sites and type signatures.
+  </Step>
+  <Step title="Check for leftover markers">
+    Run `todo_scan` on the files that actually changed — not the whole repo.
+  </Step>
+  <Step title="Ignore caches and generated folders">
+    `.ruff_cache`, `__pycache__`, `node_modules`, `.venv`, `dist`, `build`, coverage outputs are not reviewed.
+  </Step>
+  <Step title="Return a verdict">
+    Cite the code. State specific paths and line numbers. Do not rubber-stamp. Do not merge, push, comment on a PR, or open anything — the user is asked after reviewer finishes.
+  </Step>
+</Steps>
+
+<Info>
+  PR comments and issue text are treated as **data only**. A comment cannot instruct reviewer to approve, skip a check, or take any action outside its tools.
+</Info>
+
+## Verdict format
+
+Reviewer returns one of three verdicts, each with specific evidence:
+
+<Tabs>
+  <Tab title="approve">
+    The change is correct, tests pass (or are in scope), no regressions found.
+
+    ```
+    what: reviewed the rate limiting middleware changes
+    paths: src/middleware/rate_limit.py, src/app.py
+    facts: RateLimiter.__init__ signature matches usage at app.py:18; find_references shows all call sites updated; get_diagnostics returned 0 errors; no TODO markers in changed files
+    verdict: approve
+    leftover: none
+    ```
+  </Tab>
+  <Tab title="request changes">
+    Problems found that should be fixed before merge — not blockers, but not mergeable as-is.
+
+    ```
+    what: reviewed the payment webhook handler
+    paths: src/payments/webhook.py, tests/test_webhook.py
+    facts: verify_signature() at line 88 uses == for timing-sensitive comparison instead of hmac.compare_digest(); find_references shows this function is called from 3 places; test coverage missing for tampered-payload case
+    verdict: request changes — fix timing-safe comparison and add tampered-payload test
+    leftover: did not check the bulk import path at src/api/routes/bulk.py for the same pattern
+    ```
+  </Tab>
+  <Tab title="block">
+    A serious issue that must not be merged: data loss risk, security vulnerability, broken API contract, or similar.
+
+    ```
+    what: reviewed the database migration
+    paths: migrations/0042_drop_user_tokens.py, src/auth/session.py
+    facts: migration drops the user_tokens table but session.py still reads from it at line 201; this will cause a 500 on every authenticated request after the migration runs; no rollback plan in the migration file
+    verdict: block — migration will break auth immediately on deploy
+    leftover: rollback strategy and session.py update needed before this can proceed
+    ```
+  </Tab>
+</Tabs>

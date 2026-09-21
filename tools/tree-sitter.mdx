@@ -1,0 +1,277 @@
+---
+title: "Tree-sitter Tools: AST-Based Code Analysis"
+sidebarTitle: "Tree-sitter"
+description: "Five offline AST tools for symbol outlines, definition lookup, node inspection, S-expression queries, and compact parse-tree views across Python, Go, JS, and TS."
+---
+
+The tree-sitter tools parse source files locally using embedded grammars — no language server is needed. They run instantly on any supported file type and are the right first choice when you need to locate definitions, inspect syntax structure, or run structural queries without waiting for an LSP warm-start.
+
+<CardGroup cols={2}>
+  <Card title="list_symbols" icon="list">
+    File outline: all definitions and imports with positions.
+  </Card>
+  <Card title="find_symbol" icon="crosshairs">
+    Locate a named definition and return its source + 1-based position.
+  </Card>
+  <Card title="get_node_at" icon="location-dot">
+    Inspect the AST node at a 1-based line/character coordinate.
+  </Card>
+  <Card title="query_tree" icon="code">
+    Run a preset or raw S-expression query against a file.
+  </Card>
+  <Card title="parse_file" icon="sitemap">
+    Compact named-node tree with line ranges and nesting depth.
+  </Card>
+</CardGroup>
+
+---
+
+## Supported languages
+
+| Language | File extensions | Grammar key |
+|---|---|---|
+| Python | `.py`, `.pyi` | `python` |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | `javascript` |
+| TypeScript | `.ts`, `.mts`, `.cts` | `typescript` |
+| TypeScript JSX | `.tsx` | `typescript_jsx` |
+| Go | `.go` | `go` |
+
+All five tools accept a `language` override parameter. Pass the grammar key (e.g. `"go"`) to force a specific parser regardless of file extension. Use `"tsx"` or `"typescript_jsx"` for `.tsx` files.
+
+<Note>
+Files with an unsupported extension return `error: no tree-sitter grammar for '<path>' (extension …; supported: python, go, javascript, typescript)`.
+</Note>
+
+---
+
+## When to use tree-sitter vs LSP
+
+| Task | Use |
+|---|---|
+| Find where a function is defined in one file | `find_symbol` (instant) |
+| Jump to the definition across files, following imports | `goto_definition` (LSP) |
+| See all defs and imports in a file | `list_symbols` (instant) |
+| Get a full symbol list including enums and interfaces | `document_symbols` (LSP) |
+| Check what node type surrounds a position | `get_node_at` (instant) |
+| Get the inferred type at a position | `hover` (LSP) |
+| Find all calls to a function | `query_tree` preset `calls` (instant) |
+| Find all usages across the repo | `find_references` (LSP) |
+
+---
+
+## `list_symbols`
+
+```python
+list_symbols(ctx: ToolContext, path: str, language: str = "") -> str
+```
+
+Produces a hierarchical outline of all definitions (functions, classes, methods, types) and import statements found in the file. Each entry is indented to reflect nesting depth and annotated with a `file:line:col` position for the name node.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Grammar override: `python`, `go`, `javascript`, `typescript`. Empty = infer from extension.
+</ParamField>
+
+### Return value
+
+```
+14 symbol(s) in agents/loop.py
+import from agents.base  agents/loop.py:1:1
+import from protocol.commands  agents/loop.py:2:1
+class AgentLoop  agents/loop.py:12:7
+  function __init__  agents/loop.py:13:9
+  method run  agents/loop.py:22:9
+  method _dispatch  agents/loop.py:41:9
+```
+
+Returns `No symbols in '<path>'` for files with no detectable definitions. Symbol kinds are `function`, `class`, `method`, `interface`, `type`, `variable`, and `import`.
+
+---
+
+## `find_symbol`
+
+```python
+find_symbol(ctx: ToolContext, path: str, symbol: str, language: str = "") -> str
+```
+
+Searches the file's AST for a top-level or nested definition matching `symbol` by name, returns its full source text, and reports the 1-based `line:character` of the name node. Pass those coordinates directly to `goto_definition`, `find_references`, or `hover`.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="symbol" type="str" required>
+  The exact identifier name: function name, class name, or method name.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Grammar override.
+</ParamField>
+
+### Return value
+
+```
+Found 'AgentLoop' at agents/loop.py:12:7 (pass this line/character to goto_definition, find_references, or hover)
+
+class AgentLoop:
+    def __init__(self, session: EngineSession) -> None:
+        self.session = session
+    ...
+```
+
+Returns `Symbol '<name>' not found in '<path>'` if no matching definition exists.
+
+---
+
+## `get_node_at`
+
+```python
+get_node_at(ctx: ToolContext, path: str, line: int, character: int, language: str = "") -> str
+```
+
+Returns structural information about the tree-sitter node covering the 1-based `line:character` position: node type, text snippet, parent, the enclosing definition, and up to 20 named children.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="line" type="int" required>
+  1-based line number.
+</ParamField>
+
+<ParamField path="character" type="int" required>
+  1-based column of, or within, the token of interest.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Grammar override.
+</ParamField>
+
+### Return value
+
+```
+agents/loop.py:22:9
+type: function_definition
+name: run
+text: def run(self) -> None:…
+parent: block  agents/loop.py:13:5
+enclosing: class AgentLoop  agents/loop.py:12:7
+named children:
+  identifier run  agents/loop.py:22:13
+  parameters  agents/loop.py:22:16
+  type  agents/loop.py:22:26
+  block  agents/loop.py:23:9
+```
+
+<Note>
+`get_node_at` reports local **syntax** structure, not types or documentation. For type information, use `hover` (LSP).
+</Note>
+
+---
+
+## `query_tree`
+
+```python
+query_tree(ctx: ToolContext, path: str, preset: str = "", query: str = "", language: str = "") -> str
+```
+
+Executes a tree-sitter query on the file and returns captures as `path:line:col  node_type  text` lines. Supply either a named `preset` or a raw tree-sitter S-expression `query`. Presets are defined per-language and cover the most common structural queries.
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="preset" type="str" default='""'>
+  One of the five built-in presets (see table below). Takes precedence when both `preset` and `query` are supplied.
+</ParamField>
+
+<ParamField path="query" type="str" default='""'>
+  Raw tree-sitter S-expression query string. Used only when `preset` is empty.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Grammar override.
+</ParamField>
+
+### Presets
+
+| Preset | Captures |
+|---|---|
+| `imports` | All import statements |
+| `functions` | Top-level function declarations |
+| `classes` | Class declarations (includes interfaces and type aliases in TypeScript) |
+| `methods` | Method definitions inside classes |
+| `calls` | Function call expressions |
+
+<Tip>
+Prefer presets over raw queries — the engine maintains them per language and they work across all supported grammars without you needing to know each grammar's node names.
+</Tip>
+
+### Return value
+
+```
+6 capture(s) for functions in agents/loop.py
+agents/loop.py:12:1  class_definition  class AgentLoop:
+agents/loop.py:22:5  function_definition  def run(self) -> None:
+...
+```
+
+Returns `No captures for <preset> in '<path>'` when the query matches nothing. Captures are capped at 80 (`QUERY_MAX`). Excess captures are indicated with `... (N more; narrow the query or preset)`.
+
+### Raw query example
+
+```python
+# Find all assignments in Python
+query_tree(
+    ctx,
+    "src/config.py",
+    query="(assignment left: (identifier) @name)"
+)
+```
+
+---
+
+## `parse_file`
+
+```python
+parse_file(ctx: ToolContext, path: str, language: str = "") -> str
+```
+
+Produces a compact, indented tree of named AST nodes — showing node types, optional names, and line ranges. Useful when `list_symbols` is too flat and you need to understand the nesting shape of a file (e.g. nested classes, decorated functions, exported wrappers).
+
+### Parameters
+
+<ParamField path="path" type="str" required>
+  Workspace-relative path.
+</ParamField>
+
+<ParamField path="language" type="str" default='""'>
+  Grammar override.
+</ParamField>
+
+### Return value
+
+```
+8 named node(s) in runtime/config.py
+module  runtime/config.py:1:1-312
+  class_definition EngineConfig  runtime/config.py:14:1-80
+    function_definition __init__  runtime/config.py:15:5-79
+  function_definition from_env  runtime/config.py:82:1-110
+```
+
+Output is capped at `200` named nodes and `8` nesting levels. When truncated, the output ends with `... (capped at 200 named nodes / depth 8)`.
+
+<Note>
+`parse_file` is intentionally less detailed than a full CST dump. It shows only "interesting" node types (definitions, modules, export wrappers, decorated nodes). For exhaustive CST inspection, use `get_node_at` at specific positions.
+</Note>

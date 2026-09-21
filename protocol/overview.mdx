@@ -1,0 +1,160 @@
+---
+title: "NDJSON Wire Protocol Over Unix Domain Socket"
+sidebarTitle: "Overview"
+description: "Clients connect to a Unix domain socket and exchange newline-delimited JSON messages — commands going in, events coming out — with no access to engine internals."
+---
+
+CodeLoom Engine exposes a strict process boundary: every message that crosses the socket is a typed JSON object, and nothing else ever does. Clients send **commands** to drive the engine, and the engine broadcasts **events** back to every connected subscriber. Because the transport is a plain Unix domain socket carrying newline-delimited JSON, any language that can open a socket and parse a line of JSON can drive a full AI coding agent without importing a single Python module.
+
+## Transport
+
+The engine binds a **Unix domain socket** (`AF_UNIX`) at a well-known path inside the workspace's `.engine` directory:
+
+```
+{workspace}/.engine/engine.sock
+```
+
+The socket is created on startup and removed on shutdown. Multiple clients may connect simultaneously — each gets its own pair of asyncio tasks (one for reading commands, one for writing events). Commands from any client mutate the single shared session; events fan out to every subscriber so all clients see the same stream.
+
+<Note>
+  The socket path is printed in the startup banner. Pass the workspace root to `python app.py /path/to/project` and the engine will always put the socket at `{workspace}/.engine/engine.sock`.
+</Note>
+
+## Message format
+
+The protocol is **newline-delimited JSON** (NDJSON): one complete JSON object per line, terminated by `\n`. Every message carries a `type` field whose value is the Python dataclass name of the message. `None` fields are omitted on the wire.
+
+```json
+{"type": "StartSession", "workspace": "/home/user/myproject"}
+{"type": "SnapshotReady", "snapshot": {"session_id": "abc123", ...}}
+```
+
+The asyncio `StreamReader` is configured with a `STREAM_LIMIT` of **8 MiB** per line (vs. the asyncio default of 64 KiB), because a `SnapshotReady` payload for a large repository with many open files and a long chat history does not fit in 64 KiB. If an encoded event would exceed that limit, the engine substitutes an `ErrorOccurred` explaining the drop rather than corrupting the stream.
+
+<Info>
+  Decoding is registry-driven. The `@command` and `@event` decorators populate `COMMANDS` and `EVENTS` dicts keyed by class name. `decode_command` / `decode_event` dispatch on the `type` field. Unknown types, non-object payloads, and malformed JSON all raise `ProtocolError`, which the server reports as `ErrorOccurred` without dropping the connection.
+</Info>
+
+## Directions
+
+<CardGroup cols={2}>
+  <Card title="Commands" icon="arrow-right-to-bracket">
+    **Client → Engine.** Sent by the client to drive session lifecycle, submit
+    messages, query state, manage files, control agents, and configure
+    integrations. See the [Commands reference](/protocol/commands).
+  </Card>
+  <Card title="Events" icon="arrow-left-from-bracket">
+    **Engine → Client.** Emitted by the engine and broadcast to every connected
+    subscriber. Cover chat, agent lifecycle, tool calls, file and git state,
+    session state, errors, and integrations. See the [Events reference](/protocol/events).
+  </Card>
+</CardGroup>
+
+## Connection flow
+
+<Steps>
+  <Step title="Connect to the socket">
+    Open a TCP-like connection to `{workspace}/.engine/engine.sock`. The engine
+    begins reading commands and queuing events immediately.
+  </Step>
+  <Step title="Send StartSession">
+    The first command must be `StartSession`. Pass the same `workspace` path the
+    engine was booted with. Optionally supply a `session_id` to resume a
+    persisted session.
+
+    ```json
+    {"type": "StartSession", "workspace": "/home/user/myproject"}
+    ```
+  </Step>
+  <Step title="Receive SnapshotReady">
+    The engine responds with a `SnapshotReady` event carrying the full
+    `EngineSnapshot`. For a new session the snapshot has empty `messages`; for a
+    resumed session it includes the persisted chat history.
+
+    ```json
+    {"type": "SnapshotReady", "snapshot": {"session_id": "...", "workspace": "...", ...}}
+    ```
+  </Step>
+  <Step title="Exchange messages">
+    Send commands on your write side; read events from the read side. Both
+    directions are active concurrently.
+  </Step>
+</Steps>
+
+## Minimal Python client
+
+The following example demonstrates opening a connection, sending `StartSession`, and printing every event until `SnapshotReady` arrives. It uses only the standard library.
+
+```python title="minimal_client.py"
+import asyncio
+import json
+
+SOCKET_PATH = "/home/user/myproject/.engine/engine.sock"
+WORKSPACE   = "/home/user/myproject"
+STREAM_LIMIT = 8 * 1024 * 1024  # must match engine's STREAM_LIMIT
+
+
+async def main() -> None:
+    reader, writer = await asyncio.open_unix_connection(
+        SOCKET_PATH, limit=STREAM_LIMIT
+    )
+
+    # Send the handshake command
+    command = {"type": "StartSession", "workspace": WORKSPACE}
+    writer.write((json.dumps(command) + "\n").encode())
+    await writer.drain()
+
+    # Read events until the snapshot arrives
+    async for raw_line in reader:
+        event = json.loads(raw_line)
+        print(f"[{event['type']}]", list(event.keys()))
+        if event["type"] == "SnapshotReady":
+            print("session_id:", event["snapshot"]["session_id"])
+            break
+
+    writer.close()
+    await writer.wait_closed()
+
+
+asyncio.run(main())
+```
+
+<Tip>
+  Set `limit=STREAM_LIMIT` (8 MiB) when calling `asyncio.open_unix_connection`.
+  The default 64 KiB limit will cause `readline()` to truncate snapshots for
+  large sessions, resulting in a `json.JSONDecodeError`.
+</Tip>
+
+## Reconnection and snapshot replay
+
+Clients may disconnect and reconnect at any time. On reconnect, send `StartSession` again with the same `session_id` to resume. The engine will replay the persisted chat history as `ChatHistoryAdded` events followed by `ChatHistoryComplete`.
+
+To request a fresh snapshot at any time without disconnecting, send `RequestSnapshot`:
+
+```json
+{"type": "RequestSnapshot", "replay": true}
+```
+
+| `replay` value | Behaviour |
+|---|---|
+| `true` (default) | Full `SnapshotReady` + per-file `FileContent` events + `ChatHistoryAdded` replay |
+| `false` | Base `SnapshotReady` only (counts, git, agents, stats) — no file contents or history replay |
+
+The replay uses a **generation counter** to cancel any in-flight history stream before starting a new one, so a second `RequestSnapshot` while the first replay is still streaming causes the stale task to stop rather than interleaving two histories.
+
+See [EngineSnapshot reference](/protocol/snapshot) for a full description of every field in the snapshot payload.
+
+## Security: secret redaction
+
+The `token` field of `CompleteMcpAuth` is automatically redacted in server logs. The wire value is never logged or echoed back; only `<redacted>` appears in any diagnostic output. No other command fields are redacted.
+
+```python title="protocol/redact.py (excerpt)"
+if isinstance(command, CompleteMcpAuth):
+    data["token"] = "<redacted>"
+```
+
+<Warning>
+  The socket has no built-in authentication. It is a filesystem path — protect
+  it with Unix file permissions. On a shared machine, restrict access to
+  `.engine/` so that only trusted processes can connect.
+</Warning>

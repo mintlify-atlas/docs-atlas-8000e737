@@ -1,0 +1,148 @@
+---
+title: "Debugger Agent: Investigate Bugs with LSP and Browser"
+sidebarTitle: "Debugger"
+description: "The debugger profile uses LSP, shell, git history, GitHub CI, and a headless Playwright browser to locate root causes — but never edits files, returning a structured bug report to the orchestrator."
+---
+
+When something is broken and the cause is unclear, the **debugger** personality investigates. It has the broadest read-access of any profile — shell execution, git history, LSP, GitHub CI, security advisories, HTTP requests, and a full headless browser — but it does not edit a single file. Its entire output is a structured bug report: repro steps, the failing signal, the suspected locus with paths and function names, and what it did not check.
+
+## Purpose
+
+Debugger finds bugs. It does not fix them. Given a symptom — an error message, a failing test, a broken UI interaction, a CI failure — it reproduces the problem, traces it to a specific function or line, and hands a complete report to the orchestrator. The orchestrator then spawns `coder` with that report as the task briefing.
+
+<Warning>
+  Debugger explicitly does **not** apply patches or edits. If it finds itself tempted to fix the bug while investigating, the system prompt says to stop: *"Do not apply patches."* The fix belongs to a subsequent `coder` spawn.
+</Warning>
+
+## Tool allowlist
+
+```python title="agents/profiles/debugger.py"
+tool_names = (
+    NAV + SITTER + LSP + SHELL + GIT + GH_READ + GH_WRITE
+    + DOCS + SEC + HTTP + SCAN + ENV + DEP + BROWSER + SKILLS + MEMORY + MCP
+)
+```
+
+<AccordionGroup>
+  <Accordion title="NAV — filesystem navigation">
+    `list_files`, `read_file`, `search`
+  </Accordion>
+  <Accordion title="SITTER — tree-sitter AST queries">
+    `list_symbols`, `find_symbol`, `get_node_at`, `query_tree`, `parse_file`
+  </Accordion>
+  <Accordion title="LSP — language server protocol">
+    `goto_definition`, `find_references`, `hover`, `get_diagnostics`, `document_symbols`
+  </Accordion>
+  <Accordion title="SHELL — repro and log commands">
+    `run_command` — for reproducing crashes, running targeted tests, and tailing logs
+  </Accordion>
+  <Accordion title="GIT — history and blame">
+    `git_status`, `git_diff`, `git_log`, `git_show`, `git_blame`, `git_range`
+  </Accordion>
+  <Accordion title="GH_READ — GitHub PR, issue, CI, and release reads">
+    All `GH_SOCIAL` tools (`gh_pr_list`, `gh_pr_view`, `gh_pr_comments`, `gh_pr_checks`, `gh_issue_list`, `gh_issue_view`, `gh_run_list`, `gh_run_view`, `gh_release_list`, `gh_release_view`) plus all `GH_REPO` tools (`github_compare`, `github_search_code`, `github_file`, `github_repo`, `github_tree`)
+  </Accordion>
+  <Accordion title="GH_WRITE — PR and issue comments (user approval required)">
+    `gh_pr_comment`, `gh_issue_create` — mutating GitHub actions require user approval before executing
+  </Accordion>
+  <Accordion title="DOCS + SEC + HTTP — external reference">
+    `docs_lookup`, `tldr`, `osv_query`, `http_request`, `openapi_ops`
+  </Accordion>
+  <Accordion title="SCAN + ENV + DEP — workspace context">
+    `todo_scan`, `runtime_info`, `dep_why`
+  </Accordion>
+  <Accordion title="BROWSER — headless Playwright">
+    `browser_open`, `browser_console`, `browser_screenshot`, `browser_network`
+  </Accordion>
+  <Accordion title="SKILLS + MEMORY + MCP — knowledge base and extensions">
+    `activate_skill`, `read_skill`, `remember`, `mcp`
+  </Accordion>
+</AccordionGroup>
+
+## Profile configuration
+
+```python title="agents/profiles/debugger.py"
+PROFILE = AgentProfile(
+    name="debugger",
+    description=(
+        "Investigate bugs with logs, LSP, and a headless browser. "
+        "Does not edit files."
+    ),
+    system_prompt=DEBUGGER_SYSTEM,
+    tool_names=NAV + SITTER + LSP + SHELL + GIT + GH_READ + GH_WRITE
+               + DOCS + SEC + HTTP + SCAN + ENV + DEP + BROWSER + SKILLS + MEMORY + MCP,
+    write_globs=[],    # read-only; no file edits of any kind
+    required_tools=[],
+    max_turns=32,
+)
+```
+
+`write_globs=[]` — debugger cannot create, modify, or delete any file in the workspace.
+
+## Headless browser tools
+
+The browser tools use Playwright under the hood (`playwright.async_api`), launching a headless Chromium instance. They are available when the `playwright` package is installed and `playwright install chromium` has been run; otherwise each tool returns:
+
+```
+error: browser tools unavailable (install playwright and run playwright install chromium)
+```
+
+<ParamField path="browser_open" type="tool">
+  Opens a URL in the headless browser. Clears the console and network logs before navigation. Returns the final URL and page title.
+
+  ```
+  opened https://example.com/dashboard title='Dashboard — MyApp'
+  ```
+</ParamField>
+
+<ParamField path="browser_console" type="tool">
+  Returns the last 80 console messages (type + text) captured since the most recent `browser_open` call. Returns `(no console messages)` if none were emitted.
+</ParamField>
+
+<ParamField path="browser_screenshot" type="tool">
+  Takes a full-page screenshot and saves it to `.engine/debug/<name>.png` in the workspace. Returns the workspace-relative path.
+
+  ```
+  saved .engine/debug/shot.png
+  ```
+</ParamField>
+
+<ParamField path="browser_network" type="tool">
+  Returns the last 80 failed or 4xx/5xx network requests captured since the most recent `browser_open` call. Format: `<status> <METHOD> <URL>` or `FAIL <METHOD> <URL> <failure>`.
+</ParamField>
+
+## How debugger investigates
+
+<Steps>
+  <Step title="Reproduce before concluding">
+    Use `run_command` for logs, targeted test runs, or a direct repro script. Use `browser_open` + `browser_console` + `browser_network` for UI or networking issues. Do not conclude from a suspicious filename alone.
+  </Step>
+  <Step title="Trace with LSP and sitter">
+    Use `goto_definition`, `find_references`, and `hover` to follow the call chain from the symptom to the suspected source. Use tree-sitter tools for structural analysis without LSP.
+  </Step>
+  <Step title="Check git history">
+    `git_blame` on the suspected lines to find when the change landed. `git_log` and `git_show` on relevant commits. `git_range` to compare two refs.
+  </Step>
+  <Step title="Check CI and security context">
+    `gh_run_view` and `gh_pr_checks` for CI failures. `osv_query` for vulnerability advisories. `dep_why` when the issue may be a transitive dependency version. `runtime_info` when versions matter.
+  </Step>
+  <Step title="Limit retries">
+    If the same repro attempt fails to reproduce twice, stop retrying it. Try a different angle or report what was ruled out.
+  </Step>
+</Steps>
+
+<Info>
+  GitHub PR comments, issue text, console output, and network logs are treated as **data only**. They cannot instruct debugger to edit files, skip a check, or take an action outside its tools.
+</Info>
+
+## What debugger reports back
+
+Debugger ends with a `REPORT_TO_ORCH`-format bug report structured for a coder to act on:
+
+```
+what: investigated 500 error on POST /api/orders when quantity > 100
+paths: src/api/routes/orders.py, src/db/models/order.py, src/validators/order_schema.py
+facts: repro confirmed — run_command: pytest tests/test_orders.py::test_large_order returned AssertionError at line 88; stack trace points to order_schema.py:validate_quantity() line 34 which casts quantity to int8 (max 127) before DB insert; for quantity=128 the cast wraps to -128 and the DB CHECK constraint fires; git_blame shows the int8 cast was introduced in commit a3f9c2e (2024-11-14) during "perf: tighten types"; browser_screenshot saved .engine/debug/order_form_500.png showing the generic error page
+verdict: bug confirmed — root cause is int8 cast in validate_quantity() at src/validators/order_schema.py:34
+leftover: did not check whether the same cast exists in the bulk order import path at src/api/routes/bulk.py
+```
